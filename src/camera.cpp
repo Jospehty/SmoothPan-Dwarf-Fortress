@@ -82,18 +82,9 @@ void SmoothCamera::update() {
         expected_win_y = win_y;
     }
     
-    // Zoom sync and interpolation
-    int game_zoom = df::global::gps->viewport_zoom_factor;
-    int expected_zoom = static_cast<int>(std::round(true_zoom));
-    if (game_zoom != expected_zoom && std::abs(game_zoom - expected_zoom) > 1) {
-        true_zoom = target_zoom = game_zoom;
-    } else {
-        float zoom_lerp = 1.0f - std::exp(-zoom_easing * dt);
-        true_zoom += (target_zoom - true_zoom) * zoom_lerp;
-        int new_zoom = static_cast<int>(std::round(true_zoom));
-        if (new_zoom != game_zoom) {
-            df::global::gps->viewport_zoom_factor = new_zoom;
-        }
+    // Zoom sync (Read-only now, zoom commands handled in sdl_hook.cpp)
+    if (df::global::gps) {
+        true_zoom = target_zoom = df::global::gps->viewport_zoom_factor;
     }
     
     // Input vectors

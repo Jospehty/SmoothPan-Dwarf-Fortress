@@ -10,6 +10,8 @@
 #include "df/graphic.h"
 #include "df/enabler.h"
 #include "df/world.h"
+#include "df/zoom_commands.h"
+#include <mutex>
 
 typedef int(*SDL_PollEvent_t)(SDL_Event* event);
 typedef int(*SDL_RenderCopy_t)(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect);
@@ -34,8 +36,19 @@ int Hook_SDL_PollEvent(SDL_Event* event) {
             }
             event->type = SDL_FIRSTEVENT; // Nullify event so game ignores it
         } else { // Normal scroll for Zoom
-            if (event->wheel.y > 0) g_camera.zoom_in();
-            else if (event->wheel.y < 0) g_camera.zoom_out();
+            if (event->wheel.y > 0) {
+                if (df::global::enabler) {
+                    std::lock_guard<std::mutex> lock(df::global::enabler->async_zoom.mtx);
+                    df::global::enabler->async_zoom.vals.push_back(df::zoom_commands::zoom_in);
+                    df::global::enabler->async_zoom.cv.notify_one();
+                }
+            } else if (event->wheel.y < 0) {
+                if (df::global::enabler) {
+                    std::lock_guard<std::mutex> lock(df::global::enabler->async_zoom.mtx);
+                    df::global::enabler->async_zoom.vals.push_back(df::zoom_commands::zoom_out);
+                    df::global::enabler->async_zoom.cv.notify_one();
+                }
+            }
             event->type = SDL_FIRSTEVENT;
         }
     }
