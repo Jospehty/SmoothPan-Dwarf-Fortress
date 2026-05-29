@@ -11,7 +11,6 @@
 #include "df/graphic.h"
 
 #include "df/world.h"
-#include "df/map_statest.h"
 
 #include "camera.h"
 

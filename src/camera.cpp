@@ -1,7 +1,6 @@
 #include "camera.h"
 #include "df/global_objects.h"
 #include "df/world.h"
-#include "df/map_statest.h"
 #include "df/graphic.h"
 #include <cmath>
 #include <windows.h>
