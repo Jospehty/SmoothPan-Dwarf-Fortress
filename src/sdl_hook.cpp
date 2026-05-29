@@ -17,10 +17,12 @@
 typedef int(*SDL_PollEvent_t)(SDL_Event* event);
 typedef int(*SDL_RenderCopy_t)(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect);
 typedef int(*SDL_RenderCopyEx_t)(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect, const double angle, const SDL_Point* center, const SDL_RendererFlip flip);
+typedef int(*SDL_GetRendererOutputSize_t)(SDL_Renderer* renderer, int* w, int* h);
 
 SDL_PollEvent_t True_SDL_PollEvent = nullptr;
 SDL_RenderCopy_t True_SDL_RenderCopy = nullptr;
 SDL_RenderCopyEx_t True_SDL_RenderCopyEx = nullptr;
+SDL_GetRendererOutputSize_t GetRendererOutputSize_func = nullptr;
 
 int Hook_SDL_PollEvent(SDL_Event* event) {
     int result = True_SDL_PollEvent(event);
@@ -63,9 +65,9 @@ int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_
                 modified_dst.y -= static_cast<int>(frac_y * z);
 
                 float sdl_scale = g_camera.true_zoom / static_cast<float>(z);
-                if (std::abs(sdl_scale - 1.0f) > 0.001f) {
-                    int win_w, win_h;
-                    SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+                if (std::abs(sdl_scale - 1.0f) > 0.001f && GetRendererOutputSize_func) {
+                    int win_w = 1920, win_h = 1080;
+                    GetRendererOutputSize_func(renderer, &win_w, &win_h);
                     float cx = win_w / 2.0f;
                     float cy = win_h / 2.0f;
                     float dx = modified_dst.x - cx;
@@ -96,9 +98,9 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
                 modified_dst.y -= static_cast<int>(frac_y * z);
 
                 float sdl_scale = g_camera.true_zoom / static_cast<float>(z);
-                if (std::abs(sdl_scale - 1.0f) > 0.001f) {
-                    int win_w, win_h;
-                    SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+                if (std::abs(sdl_scale - 1.0f) > 0.001f && GetRendererOutputSize_func) {
+                    int win_w = 1920, win_h = 1080;
+                    GetRendererOutputSize_func(renderer, &win_w, &win_h);
                     float cx = win_w / 2.0f;
                     float cy = win_h / 2.0f;
                     float dx = modified_dst.x - cx;
@@ -123,6 +125,7 @@ bool InitSDLHooks() {
     void* poll_event_addr = (void*)GetProcAddress(sdl_module, "SDL_PollEvent");
     void* render_copy_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopy");
     void* render_copy_ex_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyEx");
+    GetRendererOutputSize_func = (SDL_GetRendererOutputSize_t)GetProcAddress(sdl_module, "SDL_GetRendererOutputSize");
     
     if (poll_event_addr) MH_CreateHook(poll_event_addr, &Hook_SDL_PollEvent, reinterpret_cast<LPVOID*>(&True_SDL_PollEvent));
     if (render_copy_addr) MH_CreateHook(render_copy_addr, &Hook_SDL_RenderCopy, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopy));

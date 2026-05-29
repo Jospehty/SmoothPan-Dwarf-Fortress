@@ -27,17 +27,6 @@ void SmoothCamera::reset() {
     vel_y = 0;
 }
 
-void SmoothCamera::zoom_in() {
-    if (target_zoom == 0 && df::global::gps) target_zoom = df::global::gps->viewport_zoom_factor;
-    target_zoom += zoom_step;
-    if (target_zoom > 128.0) target_zoom = 128.0; // clamp max zoom
-}
-
-void SmoothCamera::zoom_out() {
-    if (target_zoom == 0 && df::global::gps) target_zoom = df::global::gps->viewport_zoom_factor;
-    target_zoom -= zoom_step;
-    if (target_zoom < 16.0) target_zoom = 16.0; // clamp min zoom
-}
 
 static bool is_physical_up_held() { return (GetAsyncKeyState('W') & 0x8000) || (GetAsyncKeyState(VK_UP) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD8) & 0x8000); }
 static bool is_physical_down_held() { return (GetAsyncKeyState('S') & 0x8000) || (GetAsyncKeyState(VK_DOWN) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD2) & 0x8000); }
