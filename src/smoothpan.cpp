@@ -13,6 +13,7 @@
 #include "df/world.h"
 
 #include "camera.h"
+#include <windows.h>
 
 using namespace DFHack;
 

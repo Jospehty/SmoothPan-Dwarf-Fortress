@@ -2,6 +2,7 @@
 #include "df/global_objects.h"
 #include "df/world.h"
 #include "df/graphic.h"
+#include "df/graphic_viewportst.h"
 #include <cmath>
 #include <windows.h>
 #include <algorithm>
