@@ -47,23 +47,7 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             input->erase(df::interface_key::CURSOR_RIGHT);
         }
         
-        // Diagonals
-        if (input->count(df::interface_key::CURSOR_UP_LEFT)) { 
-            g_camera.panning_up = true; g_camera.panning_left = true; 
-            input->erase(df::interface_key::CURSOR_UP_LEFT); 
-        }
-        if (input->count(df::interface_key::CURSOR_UP_RIGHT)) { 
-            g_camera.panning_up = true; g_camera.panning_right = true; 
-            input->erase(df::interface_key::CURSOR_UP_RIGHT); 
-        }
-        if (input->count(df::interface_key::CURSOR_DOWN_LEFT)) { 
-            g_camera.panning_down = true; g_camera.panning_left = true; 
-            input->erase(df::interface_key::CURSOR_DOWN_LEFT); 
-        }
-        if (input->count(df::interface_key::CURSOR_DOWN_RIGHT)) { 
-            g_camera.panning_down = true; g_camera.panning_right = true; 
-            input->erase(df::interface_key::CURSOR_DOWN_RIGHT); 
-        }
+
 
         INTERPOSE_NEXT(feed)(input);
     }
