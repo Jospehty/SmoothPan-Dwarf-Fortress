@@ -3,6 +3,7 @@
 #include "df/world.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
+#include "df/enabler.h"
 #include <cmath>
 #include <windows.h>
 #include <algorithm>
@@ -88,8 +89,8 @@ void SmoothCamera::update() {
         float zoom_lerp = 1.0f - std::exp(-zoom_easing * dt);
         true_zoom += (target_zoom - true_zoom) * zoom_lerp;
         int new_zoom = static_cast<int>(std::round(true_zoom));
-        if (new_zoom != game_zoom) {
-            df::global::gps->viewport_zoom_factor = new_zoom;
+        if (new_zoom != game_zoom && df::global::enabler) {
+            df::global::enabler->set_viewport_zoom_factor(new_zoom);
         }
     }
     
