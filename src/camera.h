@@ -8,10 +8,7 @@ struct SmoothCamera {
     double vel_x = 0;
     double vel_y = 0;
     
-    float true_zoom = 32.0f;
-    float target_zoom = 32.0f;
-    float zoom_easing = 15.0f;
-    
+
     std::chrono::steady_clock::time_point last_frame;
     bool first_frame = true;
     
@@ -24,15 +21,10 @@ struct SmoothCamera {
     bool panning_left = false;
     bool panning_right = false;
 
-    bool is_waiting_for_native_zoom = false;
-    int last_game_zoom = 32;
+
 
     void reset();
     void update();
-    
-    // Zoom control
-    void zoom_in() { target_zoom *= 1.2f; }
-    void zoom_out() { target_zoom /= 1.2f; }
 };
 
 extern SmoothCamera g_camera;
