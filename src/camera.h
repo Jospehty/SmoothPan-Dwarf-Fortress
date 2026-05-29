@@ -16,19 +16,26 @@ struct SmoothCamera {
     
     float max_speed = 50.0f;      // Max tiles per second panning
     float friction = 15.0f;       // Deceleration when keys released
-    float zoom_easing = 15.0f;    // Zoom interpolation speed
-    float zoom_step = 8.0f;       // Pixels to jump per scroll
     
     // Pan state activated by game context (feed), maintained by physical key hold (render)
     bool panning_up = false;
     bool panning_down = false;
     bool panning_left = false;
     bool panning_right = false;
-    
-    void update();
+
+    // Zoom tracking
+    float true_zoom = 32.0f;
+    float target_zoom = 32.0f;
+    float zoom_easing = 15.0f;
+    bool is_waiting_for_native_zoom = false;
+    int last_game_zoom = 32;
+
     void reset();
-    void zoom_in();
-    void zoom_out();
+    void update(float dt);
+    
+    // Zoom control
+    void zoom_in() { target_zoom *= 1.2f; }
+    void zoom_out() { target_zoom /= 1.2f; };
 };
 
 extern SmoothCamera g_camera;

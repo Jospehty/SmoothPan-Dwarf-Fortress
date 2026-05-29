@@ -3,6 +3,7 @@
 #include "camera.h"
 #include "MinHook.h"
 #include <SDL.h>
+#include <cmath>
 #include <windows.h>
 #undef min
 #undef max
@@ -37,17 +38,9 @@ int Hook_SDL_PollEvent(SDL_Event* event) {
             event->type = SDL_FIRSTEVENT; // Nullify event so game ignores it
         } else { // Normal scroll for Zoom
             if (event->wheel.y > 0) {
-                if (df::global::enabler) {
-                    std::lock_guard<std::mutex> lock(df::global::enabler->async_zoom.mtx);
-                    df::global::enabler->async_zoom.vals.push_back(df::zoom_commands::zoom_in);
-                    df::global::enabler->async_zoom.cv.notify_one();
-                }
+                g_camera.zoom_in();
             } else if (event->wheel.y < 0) {
-                if (df::global::enabler) {
-                    std::lock_guard<std::mutex> lock(df::global::enabler->async_zoom.mtx);
-                    df::global::enabler->async_zoom.vals.push_back(df::zoom_commands::zoom_out);
-                    df::global::enabler->async_zoom.cv.notify_one();
-                }
+                g_camera.zoom_out();
             }
             event->type = SDL_FIRSTEVENT;
         }
@@ -68,6 +61,20 @@ int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_
                 float frac_y = g_camera.true_y - std::floor(g_camera.true_y);
                 modified_dst.x -= static_cast<int>(frac_x * z);
                 modified_dst.y -= static_cast<int>(frac_y * z);
+
+                float sdl_scale = g_camera.true_zoom / static_cast<float>(z);
+                if (std::abs(sdl_scale - 1.0f) > 0.001f) {
+                    int win_w, win_h;
+                    SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+                    float cx = win_w / 2.0f;
+                    float cy = win_h / 2.0f;
+                    float dx = modified_dst.x - cx;
+                    float dy = modified_dst.y - cy;
+                    modified_dst.x = static_cast<int>(std::round(cx + dx * sdl_scale));
+                    modified_dst.y = static_cast<int>(std::round(cy + dy * sdl_scale));
+                    modified_dst.w = static_cast<int>(std::ceil(modified_dst.w * sdl_scale));
+                    modified_dst.h = static_cast<int>(std::ceil(modified_dst.h * sdl_scale));
+                }
             }
         }
     }
@@ -87,6 +94,20 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
                 float frac_y = g_camera.true_y - std::floor(g_camera.true_y);
                 modified_dst.x -= static_cast<int>(frac_x * z);
                 modified_dst.y -= static_cast<int>(frac_y * z);
+
+                float sdl_scale = g_camera.true_zoom / static_cast<float>(z);
+                if (std::abs(sdl_scale - 1.0f) > 0.001f) {
+                    int win_w, win_h;
+                    SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+                    float cx = win_w / 2.0f;
+                    float cy = win_h / 2.0f;
+                    float dx = modified_dst.x - cx;
+                    float dy = modified_dst.y - cy;
+                    modified_dst.x = static_cast<int>(std::round(cx + dx * sdl_scale));
+                    modified_dst.y = static_cast<int>(std::round(cy + dy * sdl_scale));
+                    modified_dst.w = static_cast<int>(std::ceil(modified_dst.w * sdl_scale));
+                    modified_dst.h = static_cast<int>(std::ceil(modified_dst.h * sdl_scale));
+                }
             }
         }
     }

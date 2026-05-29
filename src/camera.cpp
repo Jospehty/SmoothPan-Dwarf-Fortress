@@ -5,10 +5,13 @@
 #undef min
 #undef max
 #include <algorithm>
+#include <mutex>
 #include "df/global_objects.h"
 #include "df/world.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
+#include "df/enabler.h"
+#include "df/zoom_commands.h"
 
 using namespace DFHack;
 
@@ -82,9 +85,29 @@ void SmoothCamera::update() {
         expected_win_y = win_y;
     }
     
-    // Zoom sync (Read-only now, zoom commands handled in sdl_hook.cpp)
-    if (df::global::gps) {
-        true_zoom = target_zoom = df::global::gps->viewport_zoom_factor;
+    // Hybrid Zoom Logic
+    int game_zoom = df::global::gps->viewport_zoom_factor;
+    
+    float zoom_lerp = 1.0f - std::exp(-zoom_easing * dt);
+    true_zoom += (target_zoom - true_zoom) * zoom_lerp;
+    
+    static float native_zoom_cooldown = 0.0f;
+    if (native_zoom_cooldown > 0.0f) {
+        native_zoom_cooldown -= dt;
+    } else {
+        if (df::global::enabler) {
+            if (true_zoom > game_zoom * 1.15f) {
+                std::lock_guard<std::mutex> lock(df::global::enabler->async_zoom.mtx);
+                df::global::enabler->async_zoom.vals.push_back(df::zoom_commands::zoom_in);
+                df::global::enabler->async_zoom.cv.notify_one();
+                native_zoom_cooldown = 0.3f;
+            } else if (true_zoom < game_zoom * 0.85f) {
+                std::lock_guard<std::mutex> lock(df::global::enabler->async_zoom.mtx);
+                df::global::enabler->async_zoom.vals.push_back(df::zoom_commands::zoom_out);
+                df::global::enabler->async_zoom.cv.notify_one();
+                native_zoom_cooldown = 0.3f;
+            }
+        }
     }
     
     // Input vectors
