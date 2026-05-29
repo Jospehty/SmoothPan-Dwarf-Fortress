@@ -49,8 +49,8 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
         INTERPOSE_NEXT(feed)(input);
     }
 
-    DEFINE_VMETHOD_INTERPOSE(void, render, ()) {
-        INTERPOSE_NEXT(render)();
+    DEFINE_VMETHOD_INTERPOSE(void, render, (uint32_t unk)) {
+        INTERPOSE_NEXT(render)(unk);
     }
 };
 
