@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <atomic>
 
 struct SmoothCamera {
     double true_x = 0;
@@ -8,7 +9,10 @@ struct SmoothCamera {
     double vel_x = 0;
     double vel_y = 0;
     
-
+    std::atomic<float> next_frac_x{0.0f};
+    std::atomic<float> next_frac_y{0.0f};
+    std::atomic<float> current_frac_x{0.0f};
+    std::atomic<float> current_frac_y{0.0f};
     std::chrono::steady_clock::time_point last_frame;
     bool first_frame = true;
     

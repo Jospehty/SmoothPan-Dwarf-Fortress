@@ -121,4 +121,7 @@ void SmoothCamera::update() {
         *df::global::window_x = new_win_x;
         *df::global::window_y = new_win_y;
     }
+    
+    next_frac_x.store(true_x - std::floor(true_x), std::memory_order_relaxed);
+    next_frac_y.store(true_y - std::floor(true_y), std::memory_order_relaxed);
 }
