@@ -13,6 +13,7 @@
 #include "df/world.h"
 
 #include "camera.h"
+#include "sdl_hook.h"
 #include <windows.h>
 
 using namespace DFHack;
@@ -136,10 +137,12 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
         is_enabled = enable;
         if (enable) {
             g_camera.reset();
+            InitSDLHooks();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).apply();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).apply();
             out.print("SmoothPan enabled. Try using WASD to pan the map.\n");
         } else {
+            CleanupSDLHooks();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();
             out.print("SmoothPan disabled. Reverting to native camera.\n");
@@ -149,6 +152,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
 }
 
 DFhackCExport command_result plugin_shutdown(color_ostream &out) {
+    if (is_enabled) CleanupSDLHooks();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();
     return CR_OK;

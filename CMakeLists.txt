@@ -1,6 +1,5 @@
-# Add MinHook and SDL2 include directories
+# Add MinHook include directory
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/minhook/include)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/SDL2/include)
 
 # MinHook source files
 set(MINHOOK_SRCS
