@@ -1,11 +1,14 @@
+#define NOMINMAX
 #include "camera.h"
+#include <cmath>
+#include <windows.h>
+#undef min
+#undef max
+#include <algorithm>
 #include "df/global_objects.h"
 #include "df/world.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
-#include <cmath>
-#include <windows.h>
-#include <algorithm>
 
 using namespace DFHack;
 

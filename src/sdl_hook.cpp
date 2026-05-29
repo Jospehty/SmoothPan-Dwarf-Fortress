@@ -1,8 +1,11 @@
+#define NOMINMAX
 #include "sdl_hook.h"
 #include "camera.h"
 #include "MinHook.h"
 #include <SDL.h>
 #include <windows.h>
+#undef min
+#undef max
 #include "df/global_objects.h"
 #include "df/graphic.h"
 #include "df/enabler.h"

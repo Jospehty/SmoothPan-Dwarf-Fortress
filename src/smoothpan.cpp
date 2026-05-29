@@ -12,9 +12,12 @@
 
 #include "df/world.h"
 
+#define NOMINMAX
+#include <windows.h>
+#undef min
+#undef max
 #include "camera.h"
 #include "sdl_hook.h"
-#include <windows.h>
 
 using namespace DFHack;
 
