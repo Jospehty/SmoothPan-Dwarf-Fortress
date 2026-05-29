@@ -46,11 +46,16 @@ int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_
     SDL_Rect modified_dst;
     if (dstrect) {
         modified_dst = *dstrect;
-        if (df::global::gps && df::global::gps->viewport_zoom_factor > 0) {
-            float frac_x = g_camera.true_x - std::floor(g_camera.true_x);
-            float frac_y = g_camera.true_y - std::floor(g_camera.true_y);
-            modified_dst.x -= static_cast<int>(frac_x * df::global::gps->viewport_zoom_factor);
-            modified_dst.y -= static_cast<int>(frac_y * df::global::gps->viewport_zoom_factor);
+        int z = df::global::gps ? df::global::gps->viewport_zoom_factor : 0;
+        if (z > 0) {
+            bool is_map_element = ((dstrect->w == z || dstrect->w == z * 2 || dstrect->w == z * 3) &&
+                                   (dstrect->h == z || dstrect->h == z * 2 || dstrect->h == z * 3));
+            if (is_map_element) {
+                float frac_x = g_camera.true_x - std::floor(g_camera.true_x);
+                float frac_y = g_camera.true_y - std::floor(g_camera.true_y);
+                modified_dst.x -= static_cast<int>(frac_x * z);
+                modified_dst.y -= static_cast<int>(frac_y * z);
+            }
         }
     }
     return True_SDL_RenderCopy(renderer, texture, srcrect, dstrect ? &modified_dst : nullptr);
@@ -60,11 +65,16 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
     SDL_Rect modified_dst;
     if (dstrect) {
         modified_dst = *dstrect;
-        if (df::global::gps && df::global::gps->viewport_zoom_factor > 0) {
-            float frac_x = g_camera.true_x - std::floor(g_camera.true_x);
-            float frac_y = g_camera.true_y - std::floor(g_camera.true_y);
-            modified_dst.x -= static_cast<int>(frac_x * df::global::gps->viewport_zoom_factor);
-            modified_dst.y -= static_cast<int>(frac_y * df::global::gps->viewport_zoom_factor);
+        int z = df::global::gps ? df::global::gps->viewport_zoom_factor : 0;
+        if (z > 0) {
+            bool is_map_element = ((dstrect->w == z || dstrect->w == z * 2 || dstrect->w == z * 3) &&
+                                   (dstrect->h == z || dstrect->h == z * 2 || dstrect->h == z * 3));
+            if (is_map_element) {
+                float frac_x = g_camera.true_x - std::floor(g_camera.true_x);
+                float frac_y = g_camera.true_y - std::floor(g_camera.true_y);
+                modified_dst.x -= static_cast<int>(frac_x * z);
+                modified_dst.y -= static_cast<int>(frac_y * z);
+            }
         }
     }
     return True_SDL_RenderCopyEx(renderer, texture, srcrect, dstrect ? &modified_dst : nullptr, angle, center, flip);
