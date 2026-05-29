@@ -10,6 +10,9 @@
 #include "df/viewscreen_dwarfmodest.h"
 #include "df/graphic.h"
 
+#include "df/world.h"
+#include "df/map_statest.h"
+
 #include "camera.h"
 
 using namespace DFHack;
@@ -45,6 +48,32 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
         if (input->count(df::interface_key::CURSOR_RIGHT)) {
             g_camera.panning_right = true;
             input->erase(df::interface_key::CURSOR_RIGHT);
+        }
+        
+        if (input->count(df::interface_key::ZOOM_IN)) {
+            if (GetAsyncKeyState(VK_MENU) & 0x8000) {
+                if (df::global::window_z && df::global::world) {
+                    if (*df::global::window_z < df::global::world->map.z_count - 1) {
+                        (*df::global::window_z)++;
+                    }
+                }
+            } else {
+                g_camera.zoom_in();
+            }
+            input->erase(df::interface_key::ZOOM_IN);
+        }
+        
+        if (input->count(df::interface_key::ZOOM_OUT)) {
+            if (GetAsyncKeyState(VK_MENU) & 0x8000) {
+                if (df::global::window_z) {
+                    if (*df::global::window_z > 0) {
+                        (*df::global::window_z)--;
+                    }
+                }
+            } else {
+                g_camera.zoom_out();
+            }
+            input->erase(df::interface_key::ZOOM_OUT);
         }
         
 
