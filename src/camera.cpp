@@ -359,8 +359,5 @@ void SmoothCamera::sync_logic_window() {
         *df::global::window_y = render_win_y;
         last_synced_win_x = render_win_x;
         last_synced_win_y = render_win_y;
-        if (df::global::gps && df::global::gps->force_full_display_count < 1) {
-            df::global::gps->force_full_display_count = 1;
-        }
     }
 }
