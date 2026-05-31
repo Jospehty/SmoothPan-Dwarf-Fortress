@@ -74,34 +74,9 @@ std::string g_telemetry_log;
 
 extern bool &is_enabled;
 
-// Mouse-compensation diagnostics (defined in smoothpan.cpp).
-extern int g_sp_comp_reason_feed;
-extern int g_sp_comp_reason_rend;
-extern int g_sp_comp_feed_calls;
-extern int g_sp_comp_rend_calls;
-extern int g_sp_comp_sx, g_sp_comp_sy;
-extern int g_sp_comp_mx_before, g_sp_comp_mx_after;
-extern int g_sp_comp_my_before, g_sp_comp_my_after;
-extern int g_sp_comp_raw_x, g_sp_comp_raw_y;
-extern int g_click_count, g_click_reason, g_click_keys;
-extern int g_click_raw_x, g_click_raw_y;
-extern int g_click_mx_before, g_click_mx_after;
-extern int g_click_shift_x, g_click_shift_y;
-extern int g_click_inui_reason;
-extern int g_click_vp_left, g_click_vp_top, g_click_vp_right, g_click_vp_bottom;
-extern int g_click_w_x1, g_click_w_y1, g_click_w_x2, g_click_w_y2;
-extern int g_click_w_container;
 
-struct SpClickRec {
-    int n, rawx, rawy, reason, inui;
-    int sx, sy, mxb, mxa, myb, mya, px, py;
-    int mz, bm, scroll;
-    int cell, fsx100, fsy100, tx, ty;
-    int gapx, gapy, tpx;
-};
 static const int SP_CLICK_RING = 6;
-extern SpClickRec g_click_ring[SP_CLICK_RING];
-extern int g_click_ring_pos;
+
 
 static bool sdl_shift_mode_active();
 
@@ -601,42 +576,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                             df::global::gps->precise_mouse_x, df::global::gps->precise_mouse_y,
                             g_camera.render_shift_x(), g_camera.render_shift_y(),
                             origin_x, origin_y, mvp.left, mvp.top, mvp.cell_size);
-                    fprintf(f, "  comp feed=%d/%dcalls rend=%d/%dcalls sx,sy=(%d,%d) "
-                               "mx %d->%d my %d->%d\n",
-                            g_sp_comp_reason_feed, g_sp_comp_feed_calls,
-                            g_sp_comp_reason_rend, g_sp_comp_rend_calls,
-                            g_sp_comp_sx, g_sp_comp_sy,
-                            g_sp_comp_mx_before, g_sp_comp_mx_after,
-                            g_sp_comp_my_before, g_sp_comp_my_after);
-                    fprintf(f, "  lastclick #%d keys=%d reason=%d raw=(%d,%d) "
-                               "shift=(%d,%d) mx %d->%d inui=%d vp=[%d,%d..%d,%d] "
-                               "wdg=%s[%d,%d..%d,%d]\n",
-                            g_click_count, g_click_keys, g_click_reason,
-                            g_click_raw_x, g_click_raw_y,
-                            g_click_shift_x, g_click_shift_y,
-                            g_click_mx_before, g_click_mx_after,
-                            g_click_inui_reason,
-                            g_click_vp_left, g_click_vp_top,
-                            g_click_vp_right, g_click_vp_bottom,
-                            g_click_w_container ? "C" : "L",
-                            g_click_w_x1, g_click_w_y1,
-                            g_click_w_x2, g_click_w_y2);
-                    for (int ri = 0; ri < SP_CLICK_RING; ++ri) {
-                        int idx = (g_click_ring_pos - 1 - ri + SP_CLICK_RING * 2) % SP_CLICK_RING;
-                        const SpClickRec& rc = g_click_ring[idx];
-                        if (rc.n == 0) continue;
-                        fprintf(f, "    click#%d reason=%d inui=%d raw=(%d,%d) "
-                                   "precise=(%d,%d) cell=%d tpx=%d gap=(%d,%d) "
-                                   "fshift=(%.2f,%.2f) mx %d->%d / %d->%d tile=(%d,%d) "
-                                   "mzone=%d bmode=%d scroll=%d\n",
-                                rc.n, rc.reason, rc.inui, rc.rawx, rc.rawy,
-                                rc.px, rc.py, rc.cell, rc.tpx, rc.gapx, rc.gapy,
-                                rc.fsx100 / 100.0, rc.fsy100 / 100.0,
-                                rc.mxb, rc.mxa, rc.myb, rc.mya,
-                                rc.tx, rc.ty,
-                                rc.mz, rc.bm, rc.scroll);
-                    }
-                }
+                    
+                                    }
                 fprintf(f, "  blits=%d shifted=%d pass_shift=%d ui_leak=%d map=%d/%d (%.1f%%) tile=%d/%d (%.1f%%) sprite=%d/%d (%.1f%%) log=%s\n",
                         g_frame_blit_total, g_frame_blit_shifted,
                         g_frame_pass_shifted, g_frame_ui_leak_shifted,
