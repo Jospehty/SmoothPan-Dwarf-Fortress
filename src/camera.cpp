@@ -338,6 +338,9 @@ void SmoothCamera::update() {
     if (new_win_x != render_win_x || new_win_y != render_win_y) {
         render_win_x = new_win_x;
         render_win_y = new_win_y;
+        if (df::global::gps && df::global::gps->force_full_display_count < 1) {
+            df::global::gps->force_full_display_count = 1;
+        }
     }
     
     frac_x.store(static_cast<float>(true_x - render_win_x), std::memory_order_relaxed);
