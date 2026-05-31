@@ -115,17 +115,28 @@ void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
 static bool should_spoof_mouse(int x, int y, int* shift_x, int* shift_y) {
     if (!is_enabled || g_shift_mode == ShiftMode::None) return false;
     
-    // We must use last_snapshot.shift_x/y rather than calculating it manually
-    // from frac_x, because the map rendering factors in overscan_tiles_x/y.
-    // If overscan_tiles is 1, the map is drawn a full tile offset in the other direction.
-    // last_snapshot accurately records the exact pixel offset applied to the visual
-    // elements during the most recent render frame (which is what the user reacted to).
+    // Calculate the total required adjustment to map the visual coordinate
+    // (what the user saw and clicked on) to the native DF grid coordinate.
+    // 
+    // 1. last_snapshot.shift_x/y: The exact pixel shift applied during the LAST render frame.
+    // 2. window_x difference: If the game logic (update()) changed DF's window_x/y 
+    //    SINCE the last render frame, DF will process the click relative to the NEW window.
+    //    We must compensate for this difference by adding the exact tile offset.
     float sx_f = g_camera.last_snapshot.shift_x;
     float sy_f = g_camera.last_snapshot.shift_y;
+    
+    if (df::global::window_x && df::global::window_y && df::global::gps) {
+        int cell = df::global::gps->viewport_zoom_factor / 4;
+        sx_f += (g_camera.last_snapshot.window_x - *df::global::window_x) * cell;
+        sy_f += (g_camera.last_snapshot.window_y - *df::global::window_y) * cell;
+    }
+
     if (sx_f == 0.0f && sy_f == 0.0f) return false;
 
     // Only spoof if the physical mouse is NOT in a UI region.
     // IsMouseInUI checks strict viewport bounds, so vanilla bottom tabs are protected.
+    // We check the un-spoofed raw coordinate against the UI bounds, which correctly
+    // prevents spoofing when the user clicks natively drawn UI elements.
     if (IsMouseInUI(x, y)) return false;
 
     if (shift_x) *shift_x = static_cast<int>(std::lround(sx_f));
