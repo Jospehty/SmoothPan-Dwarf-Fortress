@@ -115,28 +115,10 @@ void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
 static bool should_spoof_mouse(int x, int y, int* shift_x, int* shift_y) {
     if (!is_enabled || g_shift_mode == ShiftMode::None) return false;
     
-    // Calculate the total required adjustment to map the visual coordinate
-    // (what the user saw and clicked on) to the native DF grid coordinate.
-    // 
-    // 1. last_snapshot.shift_x/y: The exact pixel shift applied during the LAST render frame.
-    // 2. window_x difference: If the game logic (update()) changed DF's window_x/y 
-    //    SINCE the last render frame, DF will process the click relative to the NEW window.
-    //    We must compensate for this difference by adding the exact tile offset.
     float sx_f = g_camera.last_snapshot.shift_x;
     float sy_f = g_camera.last_snapshot.shift_y;
-    
-    if (df::global::window_x && df::global::window_y && df::global::gps) {
-        int cell = df::global::gps->viewport_zoom_factor / 4;
-        sx_f += (g_camera.last_snapshot.window_x - *df::global::window_x) * cell;
-        sy_f += (g_camera.last_snapshot.window_y - *df::global::window_y) * cell;
-    }
-
     if (sx_f == 0.0f && sy_f == 0.0f) return false;
 
-    // Only spoof if the physical mouse is NOT in a UI region.
-    // IsMouseInUI checks strict viewport bounds, so vanilla bottom tabs are protected.
-    // We check the un-spoofed raw coordinate against the UI bounds, which correctly
-    // prevents spoofing when the user clicks natively drawn UI elements.
     if (IsMouseInUI(x, y)) return false;
 
     if (shift_x) *shift_x = static_cast<int>(std::lround(sx_f));
@@ -155,6 +137,7 @@ static void compensate_mouse(int* x, int* y) {
 
 
 int Hook_SDL_PollEvent(SDL_Event* event) {
+    g_camera.sync_logic_window();
     int ret = True_SDL_PollEvent(event);
     if (ret && event) {
         int sx, sy;
@@ -174,6 +157,7 @@ int Hook_SDL_PollEvent(SDL_Event* event) {
 }
 
 int Hook_SDL_PeepEvents(SDL_Event* events, int numevents, SDL_eventaction action, Uint32 minType, Uint32 maxType) {
+    g_camera.sync_logic_window();
     int ret = True_SDL_PeepEvents(events, numevents, action, minType, maxType);
     if (ret > 0 && events && action == SDL_GETEVENT) {
         for (int i = 0; i < ret; ++i) {
@@ -195,12 +179,14 @@ int Hook_SDL_PeepEvents(SDL_Event* events, int numevents, SDL_eventaction action
 }
 
 uint32_t Hook_SDL_GetMouseState(int* x, int* y) {
+    g_camera.sync_logic_window();
     uint32_t state = GetMouseState_func(x, y);
     compensate_mouse(x, y);
     return state;
 }
 
 uint32_t Hook_SDL_GetGlobalMouseState(int* x, int* y) {
+    g_camera.sync_logic_window();
     uint32_t state = GetGlobalMouseState_func(x, y);
     compensate_mouse(x, y);
     return state;
