@@ -272,23 +272,22 @@ void SmoothCamera::update() {
     if (render_win_x == -1 && df::global::window_x) {
         render_win_x = *df::global::window_x;
         render_win_y = *df::global::window_y;
+        last_synced_win_x = render_win_x;
+        last_synced_win_y = render_win_y;
     }
     
-    int expected_win_x = static_cast<int>(std::floor(true_x));
-    int expected_win_y = static_cast<int>(std::floor(true_y));
-    
     // If the game natively jumped the camera (e.g. recenter on event)
-    if (*df::global::window_x != render_win_x || *df::global::window_y != render_win_y) {
+    if (last_synced_win_x != -1 && (*df::global::window_x != last_synced_win_x || *df::global::window_y != last_synced_win_y)) {
         render_win_x = *df::global::window_x;
         render_win_y = *df::global::window_y;
+        last_synced_win_x = render_win_x;
+        last_synced_win_y = render_win_y;
         true_x = render_win_x + static_cast<double>(frac_x.load(std::memory_order_relaxed));
         true_y = render_win_y + static_cast<double>(frac_y.load(std::memory_order_relaxed));
         if (!panning_up && !panning_down && !panning_left && !panning_right) {
             vel_x = 0;
             vel_y = 0;
         }
-        expected_win_x = render_win_x;
-        expected_win_y = render_win_y;
     }
 
     float dx = 0, dy = 0;
@@ -350,9 +349,16 @@ void SmoothCamera::update() {
 void SmoothCamera::sync_logic_window() {
     if (!df::global::window_x || !df::global::window_y) return;
     if (render_win_x == -1) return;
+    
+    if (last_synced_win_x != -1 && (*df::global::window_x != last_synced_win_x || *df::global::window_y != last_synced_win_y)) {
+        return; 
+    }
+    
     if (*df::global::window_x != render_win_x || *df::global::window_y != render_win_y) {
         *df::global::window_x = render_win_x;
         *df::global::window_y = render_win_y;
+        last_synced_win_x = render_win_x;
+        last_synced_win_y = render_win_y;
         if (df::global::gps && df::global::gps->force_full_display_count < 1) {
             df::global::gps->force_full_display_count = 1;
         }

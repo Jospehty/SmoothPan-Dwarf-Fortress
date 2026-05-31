@@ -121,6 +121,8 @@ struct SmoothCamera {
     int last_vel_sign_y = 0;
     int render_win_x = -1;
     int render_win_y = -1;
+    int last_synced_win_x = -1;
+    int last_synced_win_y = -1;
 
 
 
