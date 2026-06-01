@@ -33,6 +33,8 @@
 #include "perf.h"
 #include "ffd_policy.h"
 #include "designation_sync.h"
+#include "zoom_probe.h"
+#include "zoom_camera.h"
 #include <SDL.h>
 #include <cstdio>
 
@@ -264,6 +266,12 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             }
             mmb_map_grab = smoothpan_middle_mouse_map_gate(gate_px, gate_py);
         }
+
+        if (input->count(df::interface_key::ZOOM_IN))
+            zoom_probe_note_feed_zoom_in();
+        if (input->count(df::interface_key::ZOOM_OUT))
+            zoom_probe_note_feed_zoom_out();
+        // Wheel zoom: vanilla only (Phase 1 intercept disabled — unsafe from logic hook).
 
         if (mmb_held && (g_camera.middle_drag_active || map_scrolling || mmb_map_grab)) {
             input->erase(df::interface_key::CURSOR_UP);
@@ -675,6 +683,8 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
         if (!is_enabled) {
             is_enabled = true;
             g_camera.reset();
+            zoom_probe_reset();
+            smoothpan_zoom_reset();
             g_shift_mode = ShiftMode::Sdl;
             InitSDLHooks();
             renderer_hook_install();

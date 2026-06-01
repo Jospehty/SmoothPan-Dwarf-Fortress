@@ -4,9 +4,9 @@ Smooth sub-tile WASD camera panning for **Dwarf Fortress Premium** (DF 50.x), im
 
 The game continues to simulate on integer tile coordinates (`window_x` / `window_y`). Sub-pixel motion is applied only at render time by shifting map SDL blits. Mouse input is compensated so designation, hover, and UI clicks stay aligned with what you see on screen.
 
-**Latest release: [v1.1.0](releases/v1.1.0/)** (plugin build 3.11.52) — adds smooth middle-mouse grab-pan; WASD and designation unchanged from v1.0.0.
+**Latest release: [v1.2.0](releases/v1.2.0/)** (plugin build 3.14.1) — stable smooth pan foundation with integrated edge tile stretch (gap-free fast MMB/WASD); smooth zoom parked for a future pass.
 
-Previous: [v1.0.0](releases/v1.0.0/) (3.11.46)
+Previous: [v1.1.0](releases/v1.1.0/) (3.11.52) · [v1.0.0](releases/v1.0.0/) (3.11.46)
 
 ---
 
@@ -29,7 +29,7 @@ C:\Program Files (x86)\Steam\steamapps\common\Dwarf Fortress\
 
 ### 2. Drop in SmoothPan
 
-1. Download [`smoothpan.plug.dll`](releases/v1.1.0/smoothpan.plug.dll) from this repo (or grab the whole [v1.1.0](releases/v1.1.0/) folder).
+1. Download [`smoothpan.plug.dll`](releases/v1.2.0/smoothpan.plug.dll) from this repo (or grab the whole [v1.2.0](releases/v1.2.0/) folder).
 2. Copy it to:
 
 ```
@@ -56,7 +56,7 @@ enable smoothpan
 You should see:
 
 ```
-SmoothPan 3.11.52 enabled
+SmoothPan 3.14.1 enabled
 ```
 
 Enter a fortress and pan with **WASD** (or arrow keys) or **middle-mouse drag** on the map.
@@ -80,7 +80,7 @@ Replace `hack\plugins\smoothpan.plug.dll`, then `plugin load smoothpan` / `enabl
 
 To uninstall: unload the plugin and delete `smoothpan.plug.dll` from `hack\plugins\`.
 
-More detail: [releases/v1.1.0/INSTALL.txt](releases/v1.1.0/INSTALL.txt)
+More detail: [releases/v1.2.0/INSTALL.txt](releases/v1.2.0/INSTALL.txt)
 
 ---
 
@@ -111,7 +111,7 @@ More detail: [releases/v1.1.0/INSTALL.txt](releases/v1.1.0/INSTALL.txt)
 
 ---
 
-## Default behavior (v1.1.0 / build 3.11.52)
+## Default behavior (v1.2.0 / build 3.14.1)
 
 | Subsystem | Default | Notes |
 |-----------|---------|-------|

@@ -4,6 +4,8 @@
 #include "viewport.h"
 #include "debug_paths.h"
 #include "version.h"
+#include "zoom_probe.h"
+#include "zoom_camera.h"
 #include "probe.h"
 #include "trace.h"
 #include "shift_mode.h"
@@ -150,6 +152,10 @@ void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
     if (!sdl_shift_mode_active()) return;
     ViewportRect vp;
     if (!get_strict_viewport_rect(&vp)) return;
+    if (smoothpan_zoom_animating()) {
+        True_SDL_RenderSetClipRect(r, nullptr);
+        return;
+    }
     // Pin the left/top of the clip to the bake-grid origin (where col/row 0 is
     // actually drawn), NOT to vp.left/top (screen_x/y, a different coordinate
     // space that fluctuates frame-to-frame).  Width/height span the full map.
@@ -284,6 +290,13 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
         // smoothpan_apply_map_clip() from the renderer hook (DF often sets no
         // clip at all during the pass).
         if (g_in_main_viewport_update.load(std::memory_order_relaxed) && sdl_shift_mode_active()) {
+            if (smoothpan_zoom_animating()) {
+                if (g_clip_log_remaining > 0 && g_test_dump_delay == 0) {
+                    g_telemetry_log += "Clip: zoom_anim -> (null)\n";
+                    g_clip_log_remaining--;
+                }
+                return True_SDL_RenderSetClipRect(renderer, nullptr);
+            }
             ViewportRect vp;
             if (get_strict_viewport_rect(&vp)) {
                 SDL_Rect snapped = { vp.origin_x, vp.origin_y,
@@ -291,10 +304,11 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
                 if (g_clip_log_remaining > 0 && g_test_dump_delay == 0) {
                     char buf[256];
                     snprintf(buf, sizeof(buf),
-                             "Clip: in=(%d,%d,%d,%d) -> origin=(%d,%d,%d,%d)\n",
+                             "Clip: in=(%d,%d,%d,%d) -> origin=(%d,%d,%d,%d) zoom=%d\n",
                              rect ? rect->x : -1, rect ? rect->y : -1,
                              rect ? rect->w : -1, rect ? rect->h : -1,
-                             snapped.x, snapped.y, snapped.w, snapped.h);
+                             snapped.x, snapped.y, snapped.w, snapped.h,
+                             smoothpan_zoom_animating() ? 1 : 0);
                     g_telemetry_log += buf;
                     g_clip_log_remaining--;
                 }
@@ -317,10 +331,33 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
     return True_SDL_RenderSetClipRect(renderer, rect);
 }
 
-// Forward declaration — defined just before Hook_SDL_RenderCopyF below.
-static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
-                           const SDL_Rect* srcrect, const SDL_FRect* orig,
-                           const SDL_FRect* shifted);
+// Forward declaration — extend last grid tile to viewport edge (see below).
+static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shifted);
+
+static void map_blit_apply_pan_and_zoom(SDL_FRect* rect, SDL_FPoint* center_opt) {
+    const float fsx = g_camera.render_shift_x();
+    const float fsy = g_camera.render_shift_y();
+    rect->x -= fsx;
+    rect->y -= fsy;
+    if (center_opt) {
+        center_opt->x -= fsx;
+        center_opt->y -= fsy;
+    }
+    const float scale = g_camera.render_zoom_scale;
+    if (std::abs(scale - 1.0f) <= 0.0001f) return;
+    ViewportRect vp;
+    if (!get_strict_viewport_rect(&vp)) return;
+    const float ax = (static_cast<float>(vp.left) + static_cast<float>(vp.right)) * 0.5f;
+    const float ay = (static_cast<float>(vp.top) + static_cast<float>(vp.bottom)) * 0.5f;
+    rect->x = ax + (rect->x - ax) * scale;
+    rect->y = ay + (rect->y - ay) * scale;
+    rect->w *= scale;
+    rect->h *= scale;
+    if (center_opt) {
+        center_opt->x = ax + (center_opt->x - ax) * scale;
+        center_opt->y = ay + (center_opt->y - ay) * scale;
+    }
+}
 
 static bool should_shift_blit(const BlitClassification& c) {
     if (c.cls != BlitClass::Map) return false;
@@ -664,6 +701,18 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                     fprintf(f, "  mmb held=%d drag=%d scroll=%d gate=%d sticky=%d anchor_delta=(%d,%d)\n",
                             g_sp_mmb_held, g_sp_middle_drag, g_sp_mmb_scroll,
                             g_sp_mmb_gate, g_sp_mmb_sticky, g_sp_mmb_dx, g_sp_mmb_dy);
+                    fprintf(f, "  zoom anim=%d hold=%d dir=%d gps_z=%d baked=%d target=%d pending=%d "
+                               "intercept=%d fail=%d fallback=%d t=%d scale=%d s0=%d\n",
+                            g_sp_zoom_anim, g_sp_zoom_hold, g_sp_zoom_dir,
+                            df::global::gps ? df::global::gps->viewport_zoom_factor : 0,
+                            g_sp_zoom_baked, g_sp_zoom_target,
+                            g_sp_zoom_pending, g_sp_zoom_intercept, g_sp_zoom_commit_fail,
+                            g_sp_zoom_fallback,
+                            static_cast<int>(smoothpan_zoom_anim_t() * 100.0f),
+                            static_cast<int>(smoothpan_zoom_render_scale() * 100.0f),
+                            static_cast<int>(smoothpan_zoom_start_scale_value() * 100.0f));
+                    zoom_probe_write_f9(f);
+                    zoom_probe_flush_discovery_log();
                     fprintf(f, "  desig active=%d paint=%d drag=%d patched_mx,my=(%d,%d) mpos=(%d,%d) "
                                "sel start=(%d,%d,%d) end=(%d,%d,%d)\n",
                             g_sp_desig_active, g_sp_desig_paint, g_sp_desig_drag,
@@ -739,6 +788,18 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
         g_telemetry_log.clear();
     }
 
+    smoothpan_zoom_on_present(g_frame_map_shifted, g_frame_map_total);
+    g_frame_blit_total = 0;
+    g_frame_blit_shifted = 0;
+    g_frame_map_total = 0;
+    g_frame_map_shifted = 0;
+    g_frame_tile_total = 0;
+    g_frame_tile_shifted = 0;
+    g_frame_sprite_total = 0;
+    g_frame_sprite_shifted = 0;
+    g_frame_pass_shifted = 0;
+    g_frame_ui_leak_shifted = 0;
+
     // All SDL blits for this frame have fired.  Now that render_shift_x()
     // has been used, it is safe to clear the overscan state and take the
     // per-frame snapshot.
@@ -762,21 +823,15 @@ int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_
             trace_on_sdl_blit(dstrect->x, dstrect->y, dstrect->w, dstrect->h);
         }
     }
-    if (dstrect) {
-        int sx, sy;
+    if (dstrect && True_SDL_RenderCopyF) {
+        int sx = 0, sy = 0;
         if (process_map_blit(dstrect->x, dstrect->y, dstrect->w, dstrect->h, &sx, &sy)) {
-            SDL_Rect shifted = *dstrect;
-            shifted.x = sx;
-            shifted.y = sy;
-            int result = True_SDL_RenderCopy(renderer, texture, srcrect, &shifted);
-            if (True_SDL_RenderCopyF) {
-                SDL_FRect orig_f  = { (float)dstrect->x, (float)dstrect->y,
-                                      (float)dstrect->w, (float)dstrect->h };
-                SDL_FRect shift_f = { (float)shifted.x,  (float)shifted.y,
-                                      (float)shifted.w,   (float)shifted.h };
-                fill_edge_gap(renderer, texture, srcrect, &orig_f, &shift_f);
-            }
-            return result;
+            SDL_FRect orig_f  = { static_cast<float>(dstrect->x), static_cast<float>(dstrect->y),
+                                  static_cast<float>(dstrect->w), static_cast<float>(dstrect->h) };
+            SDL_FRect shifted = orig_f;
+            map_blit_apply_pan_and_zoom(&shifted, nullptr);
+            map_blit_extend_viewport_edges(&orig_f, &shifted);
+            return True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
         }
     }
     return True_SDL_RenderCopy(renderer, texture, srcrect, dstrect);
@@ -789,67 +844,50 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
             trace_on_sdl_blit(dstrect->x, dstrect->y, dstrect->w, dstrect->h);
         }
     }
-    if (dstrect) {
-        int sx, sy;
+    if (dstrect && True_SDL_RenderCopyExF) {
+        int sx = 0, sy = 0;
         if (process_map_blit(dstrect->x, dstrect->y, dstrect->w, dstrect->h, &sx, &sy)) {
-            SDL_Rect shifted = *dstrect;
-            shifted.x = sx;
-            shifted.y = sy;
-            int result = True_SDL_RenderCopyEx(renderer, texture, srcrect, &shifted, angle, center, flip);
-            if (True_SDL_RenderCopyF) {
-                SDL_FRect orig_f  = { (float)dstrect->x, (float)dstrect->y,
-                                      (float)dstrect->w, (float)dstrect->h };
-                SDL_FRect shift_f = { (float)shifted.x,  (float)shifted.y,
-                                      (float)shifted.w,   (float)shifted.h };
-                fill_edge_gap(renderer, texture, srcrect, &orig_f, &shift_f);
+            SDL_FRect orig_f  = { static_cast<float>(dstrect->x), static_cast<float>(dstrect->y),
+                                  static_cast<float>(dstrect->w), static_cast<float>(dstrect->h) };
+            SDL_FRect shifted = orig_f;
+            SDL_FPoint center_f;
+            SDL_FPoint* center_fp = nullptr;
+            if (center) {
+                center_f.x = static_cast<float>(center->x);
+                center_f.y = static_cast<float>(center->y);
+                center_fp = &center_f;
             }
-            return result;
+            map_blit_apply_pan_and_zoom(&shifted, center_fp);
+            map_blit_extend_viewport_edges(&orig_f, &shifted);
+            return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center_fp, flip);
         }
     }
     return True_SDL_RenderCopyEx(renderer, texture, srcrect, dstrect, angle, center, flip);
 }
 
-// After shifting the last column/row tile, fill the right/bottom/corner gaps.
-//
-// WHY origin_x matters: DF tiles are always blitted at origin_x + n*cell,
-// NOT at screen_x (vp.left) + n*cell.  The renderer's origin_x is fixed
-// (typically 6px), while screen_x drifts based on map position / UI layout.
-// The gap = (screen_x - origin_x) + render_shift pixels.  Using vp.right
-// for detection would miss by exactly (screen_x - origin_x) — this was the
-// root bug causing fills never to fire.
-//
-// The fill uses the FULL last tile source, SDL-stretched to fit the gap width.
-// For normal panning the gap ≈ cell, so stretch is <5%.  Near map edges where
-// screen_x >> origin_x the stretch can reach ~20% — still far better than a
-// black bar of identical width.
-static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
-                           const SDL_Rect* srcrect, const SDL_FRect* orig,
-                           const SDL_FRect* shifted) {
-    if (!True_SDL_RenderCopyF) return;
-    if (orig->w <= 0.0f || orig->h <= 0.0f) return;
+// Last column/row tiles: stretch dst to the viewport edge in the same blit as
+// the pan shift so gap width tracks render_shift every frame (no second pass).
+static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shifted) {
+    if (!orig || !shifted || orig->w <= 0.0f || orig->h <= 0.0f) return;
+
+    const float sx = g_camera.render_shift_x();
+    const float sy = g_camera.render_shift_y();
+    if (sx < 0.5f && sy < 0.5f) return;
 
     ViewportRect vp;
     if (!get_strict_viewport_rect(&vp)) return;
 
-    float sx = g_camera.render_shift_x();
-    float sy = g_camera.render_shift_y();
-    if (sx < 0.5f && sy < 0.5f) return;
-
-    // Read the renderer's fixed tile-grid origin.
     int origin_x = 0, origin_y = 0;
     if (df::global::enabler) {
         auto* r2d = virtual_cast<df::renderer_2d>(df::global::enabler->renderer);
         if (r2d) { origin_x = r2d->origin_x; origin_y = r2d->origin_y; }
     }
 
-    // The actual tile-grid right/bottom boundary (where the last tile ends).
-    // vp.right - vp.left = dim_x * cell = vp.bottom - vp.top = dim_y * cell.
-    float tile_right  = static_cast<float>(origin_x + (vp.right  - vp.left));
-    float tile_bottom = static_cast<float>(origin_y + (vp.bottom - vp.top));
+    const float tile_right  = static_cast<float>(origin_x + (vp.right  - vp.left));
+    const float tile_bottom = static_cast<float>(origin_y + (vp.bottom - vp.top));
 
-    // Detect last column: tile's original right edge matches the tile grid end.
-    bool is_last_col = sx >= 0.5f && std::abs(orig->x + orig->w - tile_right)  < 2.0f;
-    bool is_last_row = sy >= 0.5f && std::abs(orig->y + orig->h - tile_bottom) < 2.0f;
+    const bool is_last_col = sx >= 0.5f && std::abs(orig->x + orig->w - tile_right)  < 2.0f;
+    const bool is_last_row = sy >= 0.5f && std::abs(orig->y + orig->h - tile_bottom) < 2.0f;
 
     if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
         char buf[320];
@@ -863,16 +901,6 @@ static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
         g_telemetry_log += buf;
     }
 
-    // Use the SAME integer rounding as process_map_blit (lround) so that the
-    // fill starts exactly where the shifted tile ends — no sub-pixel seam.
-    float sx_r = std::round(sx);
-    float sy_r = std::round(sy);
-
-    // NOTE: the left edge needs NO gap fill.  When panning, map content flows
-    // leftward — column 0 slides out through the (now snapped) left clip while
-    // columns 1+ cover the interior.  The left shimmer is fixed by the clip
-    // snap in Hook_SDL_RenderSetClipRect, not by a fill here.
-
     if (!is_last_col && !is_last_row) return;
 
     LARGE_INTEGER edge_t0, edge_t1, edge_freq;
@@ -882,47 +910,29 @@ static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
         QueryPerformanceCounter(&edge_t0);
     }
 
-    // Right gap: [tile_right - sx_r, vp.right] × [shifted_y, shifted_y + cell]
     if (is_last_col) {
-        float gap_x = tile_right - sx_r;
-        float gap_w = static_cast<float>(vp.right) - gap_x;
-        if (gap_w > 0.5f) {
-            SDL_FRect dst = { gap_x, shifted->y, gap_w, shifted->h };
-            True_SDL_RenderCopyF(renderer, texture, srcrect, &dst);
+        const float target_w = static_cast<float>(vp.right) - shifted->x;
+        if (target_w > shifted->w + 0.5f) {
             if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
                 char buf[128];
-                snprintf(buf, sizeof(buf), "  RightFill: (%.0f,%.0f,%.0f,%.0f)\n",
-                         dst.x, dst.y, dst.w, dst.h);
+                snprintf(buf, sizeof(buf), "  EdgeScale: right w %.1f -> %.1f (gap=%.1f)\n",
+                         shifted->w, target_w, target_w - shifted->w);
                 g_telemetry_log += buf;
             }
+            shifted->w = target_w;
         }
     }
 
-    // Bottom gap: [shifted_x, shifted_x + cell] × [tile_bottom - sy_r, vp.bottom]
     if (is_last_row) {
-        float gap_y = tile_bottom - sy_r;
-        float gap_h = static_cast<float>(vp.bottom) - gap_y;
-        if (gap_h > 0.5f) {
-            SDL_FRect dst = { shifted->x, gap_y, shifted->w, gap_h };
-            True_SDL_RenderCopyF(renderer, texture, srcrect, &dst);
+        const float target_h = static_cast<float>(vp.bottom) - shifted->y;
+        if (target_h > shifted->h + 0.5f) {
             if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
                 char buf[128];
-                snprintf(buf, sizeof(buf), "  BottomFill: (%.0f,%.0f,%.0f,%.0f)\n",
-                         dst.x, dst.y, dst.w, dst.h);
+                snprintf(buf, sizeof(buf), "  EdgeScale: bottom h %.1f -> %.1f (gap=%.1f)\n",
+                         shifted->h, target_h, target_h - shifted->h);
                 g_telemetry_log += buf;
             }
-        }
-    }
-
-    // Corner gap: [tile_right - sx_r, vp.right] × [tile_bottom - sy_r, vp.bottom]
-    if (is_last_col && is_last_row) {
-        float gap_x = tile_right  - sx_r;
-        float gap_y = tile_bottom - sy_r;
-        float gap_w = static_cast<float>(vp.right)  - gap_x;
-        float gap_h = static_cast<float>(vp.bottom) - gap_y;
-        if (gap_w > 0.5f && gap_h > 0.5f) {
-            SDL_FRect dst = { gap_x, gap_y, gap_w, gap_h };
-            True_SDL_RenderCopyF(renderer, texture, srcrect, &dst);
+            shifted->h = target_h;
         }
     }
 
@@ -948,12 +958,11 @@ int Hook_SDL_RenderCopyF(SDL_Renderer* renderer, SDL_Texture* texture, const SDL
     }
     if (dstrect && True_SDL_RenderCopyF) {
         if (process_map_blit_f(dstrect->x, dstrect->y, dstrect->w, dstrect->h)) {
-            SDL_FRect shifted = *dstrect;
-            shifted.x -= g_camera.render_shift_x();
-            shifted.y -= g_camera.render_shift_y();
-            int result = True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
-            fill_edge_gap(renderer, texture, srcrect, dstrect, &shifted);
-            return result;
+            SDL_FRect orig_f = *dstrect;
+            SDL_FRect shifted = orig_f;
+            map_blit_apply_pan_and_zoom(&shifted, nullptr);
+            map_blit_extend_viewport_edges(&orig_f, &shifted);
+            return True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
         }
     }
     return True_SDL_RenderCopyF(renderer, texture, srcrect, dstrect);
@@ -974,10 +983,17 @@ int Hook_SDL_RenderCopyExF(SDL_Renderer* renderer, SDL_Texture* texture, const S
     }
     if (dstrect && True_SDL_RenderCopyExF) {
         if (process_map_blit_f(dstrect->x, dstrect->y, dstrect->w, dstrect->h)) {
-            SDL_FRect shifted = *dstrect;
-            shifted.x -= g_camera.render_shift_x();
-            shifted.y -= g_camera.render_shift_y();
-            return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center, flip);
+            SDL_FRect orig_f = *dstrect;
+            SDL_FRect shifted = orig_f;
+            SDL_FPoint center_f;
+            SDL_FPoint* center_fp = nullptr;
+            if (center) {
+                center_f = *center;
+                center_fp = &center_f;
+            }
+            map_blit_apply_pan_and_zoom(&shifted, center_fp);
+            map_blit_extend_viewport_edges(&orig_f, &shifted);
+            return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center_fp, flip);
         }
     }
     return True_SDL_RenderCopyExF(renderer, texture, srcrect, dstrect, angle, center, flip);

@@ -7,6 +7,10 @@
 #include "sdl_hook.h"
 #include "trace.h"
 #include "version.h"
+#include "zoom_probe.h"
+#include "zoom_camera.h"
+
+#include "df/zoom_commands.h"
 
 #include "VTableInterpose.h"
 
@@ -244,6 +248,9 @@ struct smoothpan_renderer_2d_hook : public df::renderer_2d {
 
         if (is_map_vp) {
             smoothpan_apply_map_clip(sdl_renderer, false);
+            if (main_vp && vp == main_vp) {
+                smoothpan_zoom_note_main_map_baked();
+            }
         }
         g_cur_pass_is_map.store(false, std::memory_order_relaxed);
 
@@ -272,17 +279,34 @@ struct smoothpan_renderer_2d_hook : public df::renderer_2d {
         trace_on_renderer_render_end();
         renderer_log_line("render END", nullptr, nullptr);
     }
+
+    DEFINE_VMETHOD_INTERPOSE(void, zoom, (df::zoom_commands cmd)) {
+        if (is_enabled)
+            zoom_probe_note_renderer_zoom(cmd);
+        INTERPOSE_NEXT(zoom)(cmd);
+    }
+
+    DEFINE_VMETHOD_INTERPOSE(void, set_viewport_zoom_factor, (int32_t nfactor)) {
+        int prev_z = df::global::gps ? df::global::gps->viewport_zoom_factor : 0;
+        if (is_enabled)
+            zoom_probe_note_set_viewport_zoom(nfactor, prev_z);
+        INTERPOSE_NEXT(set_viewport_zoom_factor)(nfactor);
+    }
 };
 
 IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, update_full_map_port);
 IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, update_full_viewport);
 IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, render);
+IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, zoom);
+IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, set_viewport_zoom_factor);
 
 bool renderer_hook_install() {
     bool ok = true;
     ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_map_port).apply() && ok;
     ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_viewport).apply() && ok;
     ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, render).apply() && ok;
+    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, zoom).apply() && ok;
+    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, set_viewport_zoom_factor).apply() && ok;
     return ok;
 }
 
@@ -290,6 +314,8 @@ void renderer_hook_remove() {
     INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_map_port).remove();
     INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_viewport).remove();
     INTERPOSE_HOOK(smoothpan_renderer_2d_hook, render).remove();
+    INTERPOSE_HOOK(smoothpan_renderer_2d_hook, zoom).remove();
+    INTERPOSE_HOOK(smoothpan_renderer_2d_hook, set_viewport_zoom_factor).remove();
     if (g_renderer_log) {
         fclose(g_renderer_log);
         g_renderer_log = nullptr;

@@ -2,7 +2,7 @@
 
 How SmoothPan implements smooth sub-tile panning in **Dwarf Fortress Premium** (DF 50.x) without modifying the game binary.
 
-**Version documented:** 3.11.41
+**Version documented:** 3.14.1 (stable pan/MMB foundation). Smooth zoom plan: [PLAN_SMOOTH_ZOOM.md](PLAN_SMOOTH_ZOOM.md) (parked — revisit with edge-stretch lessons).
 
 ---
 
@@ -149,6 +149,8 @@ Interposes `df::renderer_2d`:
 
 Shift is applied only when `g_in_main_viewport_update` or controlled post-viewport map compositing is active — **not** for HUD overlays drawn afterward.
 
+**Edge gaps (3.14.1):** Sub-tile pan shifts map blits left/up, leaving an unbaked strip on the right/bottom. The viewport buffer is fixed-size (`dim_x × dim_y`); painting outside it requires vanilla rebake/realloc — not safe to hack. Instead, the last column/row grid tiles extend their **destination width/height in float** to the viewport edge in the **same** `RenderCopyF` as the pan shift (`map_blit_extend_viewport_edges`). One integrated stretch per frame tracks `render_shift` without a second fill pass or extra memory.
+
 All hooks no-op when `is_enabled == false`.
 
 ---
@@ -293,7 +295,10 @@ Bundled: **MinHook**, **SDL2** headers (hook targets game's SDL2.dll at runtime)
 | Modify `window_x/y` every frame for visual pan | Breaks simulation, mouse, minimap |
 | Shift all SDL blits | HUD jiggles |
 | Shift only tile-sized blits | Float entity sprites judder |
-| Overscan window offset (current SDL mode) | Asymmetric gaps; disabled |
+| Mutating `dim_x/y` during viewport bake without realloc | Buffer overrun — diagonal garbage, crash (3.13.6) |
+| SDL zoom scale > 1 without margin texels | Black bands + fill-in as scale eases (3.13.4–3.13.6) |
+| Overscan without render_shift compensation | Asymmetric gaps; 3.4.0 regression |
+| Separate edge fill blits | Second pass desync / shimmer; integrated tile stretch preferred (3.14.1) |
 | GPS + SDL hook both at boot | Double compensation |
 | Pulse ffd on cliffs | Visible 1-frame lower-z lag |
 | Per-frame full map scan for ffd | Cost; visibility stable between tile steps |

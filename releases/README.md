@@ -6,6 +6,7 @@ Each release folder contains `smoothpan.plug.dll`. You also need [DFHack](https:
 
 | Release | Plugin build | Notes |
 |---------|--------------|-------|
+| [v1.2.0](v1.2.0/) | 3.14.1 | Integrated edge tile stretch; stable pan/MMB foundation |
 | [v1.1.0](v1.1.0/) | 3.11.52 | Middle-mouse smooth grab-pan; session cleanup fixes |
 | [v1.0.0](v1.0.0/) | 3.11.46 | First public release — pan, mouse, mining designation |
 

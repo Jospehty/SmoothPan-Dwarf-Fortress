@@ -73,6 +73,7 @@ struct SmoothCamera {
 
     float render_frac_x = 0.0f;
     float render_frac_y = 0.0f;
+    float render_zoom_scale = 1.0f;
 
     float render_shift_x() const;
     float render_shift_y() const;
@@ -99,6 +100,8 @@ bool smoothpan_middle_mouse_button_held();
 bool smoothpan_middle_mouse_map_gate(int precise_x, int precise_y);
 void smoothpan_middle_mouse_update();
 void smoothpan_middle_mouse_reset();
+
+void smoothpan_notify_zoom_commit();
 
 void smoothpan_set_minimap_full_rebuild(bool full);
 bool smoothpan_minimap_full_rebuild();

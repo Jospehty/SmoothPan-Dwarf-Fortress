@@ -1,0 +1,48 @@
+SmoothPan v1.2.0 (plugin build 3.14.1)
+======================================
+
+Requirements
+  - Dwarf Fortress Premium (Steam), DF 50.x
+  - DFHack for the SAME game version (https://github.com/DFHack/dfhack/releases)
+  - Windows (64-bit)
+
+What's new in v1.2.0
+  - Edge gaps during fast pan (especially middle-mouse drag) are filled by
+    stretching the last column/row map tiles in the same blit as the pan shift
+  - Float RenderCopyF sub-tile motion with per-frame edge scaling — no extra
+    viewport memory or dim hacks
+  - Camera stability fixes (no window overscan drift; render overscan restore)
+  - GPS mouse sync and vanilla stepped zoom unchanged from v1.1.0
+  - Smooth zoom remains disabled while margin/rebake research continues
+
+Install (copy one file)
+  1. Copy smoothpan.plug.dll to:
+       {Your Dwarf Fortress folder}\hack\plugins\smoothpan.plug.dll
+
+     Steam default:
+       C:\Program Files (x86)\Steam\steamapps\common\Dwarf Fortress\hack\plugins\
+
+  2. Launch DF with DFHack (DFHack launcher or hack\launch.bat).
+
+  3. In the DFHack console:
+       plugin load smoothpan
+       enable smoothpan
+
+     You should see: SmoothPan 3.14.1 enabled
+
+  4. Enter a fortress. Pan with WASD or middle-mouse drag on the map.
+
+Optional — load automatically
+  Add to dfhack-config\init\dfhack.init (or onMapLoad.init):
+       plugin load smoothpan
+       enable smoothpan
+
+Updating from v1.1.0
+  plugin unload smoothpan
+  Replace hack\plugins\smoothpan.plug.dll
+  plugin load smoothpan
+  enable smoothpan
+
+Uninstall
+  plugin unload smoothpan
+  Delete hack\plugins\smoothpan.plug.dll

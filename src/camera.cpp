@@ -15,6 +15,8 @@
 #include "perf.h"
 #include "viewport.h"
 #include "sdl_hook.h"
+#include "zoom_probe.h"
+#include "zoom_camera.h"
 #include <cstdio>
 #include <cstring>
 
@@ -107,6 +109,12 @@ static void sync_minimap_on_pan_end() {
     minimap_mark_camera_moved(false, true);
 }
 
+void smoothpan_notify_zoom_commit() {
+    minimap_mark_camera_moved(true, true);
+    if (df::global::gps && df::global::gps->force_full_display_count < 1)
+        df::global::gps->force_full_display_count = 1;
+}
+
 void smoothpan_set_minimap_full_rebuild(bool full) {
     g_minimap_mode = full ? MinimapPanMode::Full : MinimapPanMode::Lazy;
     minimap_apply_mode_interval(g_minimap_mode);
@@ -168,6 +176,7 @@ void SmoothCamera::reset() {
     overscan_tiles_y = 0;
     overscan_active = false;
     last_zoom = 0;
+    smoothpan_zoom_reset();
     last_vel_sign_x = 0;
     last_vel_sign_y = 0;
     last_snapshot = {};
@@ -344,6 +353,7 @@ void SmoothCamera::freeze_render_frac() {
     render_frac_y = frac_y.load(std::memory_order_relaxed);
     frame_frac_x.store(render_frac_x, std::memory_order_relaxed);
     frame_frac_y.store(render_frac_y, std::memory_order_relaxed);
+    render_zoom_scale = smoothpan_zoom_render_scale();
 }
 
 // Returns the pixel width of one graphical map tile.
@@ -359,14 +369,14 @@ static int tile_cell_px() {
 float SmoothCamera::render_shift_x() const {
     int cell = tile_cell_px();
     if (cell <= 0) return 0.0f;
-    return render_frac_x * static_cast<float>(cell)
+    return render_frac_x * static_cast<float>(cell) * render_zoom_scale
          - static_cast<float>(overscan_tiles_x * cell);
 }
 
 float SmoothCamera::render_shift_y() const {
     int cell = tile_cell_px();
     if (cell <= 0) return 0.0f;
-    return render_frac_y * static_cast<float>(cell)
+    return render_frac_y * static_cast<float>(cell) * render_zoom_scale
          - static_cast<float>(overscan_tiles_y * cell);
 }
 
@@ -413,9 +423,7 @@ void SmoothCamera::begin_render_overscan() {
         snprintf(last_snapshot.overscan_reason, sizeof(last_snapshot.overscan_reason), "mode_viewport");
         return;
     }
-    // ShiftMode::Sdl: single-sided window_x overscan removes the tile on the
-    // opposite edge, producing a larger gap than no overscan at all.  Disable
-    // it here; the SDL blit hook handles the sub-tile shift directly.
+    // ShiftMode::Sdl: SDL blit shift + edge fill only (no window pull).
     if (g_shift_mode == ShiftMode::Sdl) {
         snprintf(last_snapshot.overscan_reason, sizeof(last_snapshot.overscan_reason), "mode_sdl");
         return;
@@ -525,10 +533,7 @@ void SmoothCamera::restore_window_overscan() {
 }
 
 void SmoothCamera::end_render_overscan() {
-    // Takes the per-frame snapshot then clears the overscan state.
-    // Must be called from SDL_RenderPresent, AFTER all SDL blits for the
-    // frame have been issued, so render_shift_x() returns correct values
-    // throughout the blit sequence.
+    restore_window_overscan();
     snapshot_render_state();
     overscan_tiles_x = 0;
     overscan_tiles_y = 0;
@@ -546,6 +551,7 @@ void SmoothCamera::update() {
         }
         if (df::global::gps) {
             last_zoom = df::global::gps->viewport_zoom_factor;
+            smoothpan_zoom_sync_baked();
         }
         return;
     }
@@ -553,15 +559,21 @@ void SmoothCamera::update() {
     float dt = std::chrono::duration<float>(now - last_frame).count();
     last_frame = now;
     if (dt > 0.1f) dt = 0.1f;
+    smoothpan_zoom_update(dt);
     
     if (!df::global::window_x || !df::global::window_y || !df::global::gps || !df::global::world) return;
 
     int zoom = df::global::gps->viewport_zoom_factor;
-    if (zoom != last_zoom && last_zoom != 0) {
-        true_x = *df::global::window_x;
-        true_y = *df::global::window_y;
-        vel_x = 0;
-        vel_y = 0;
+    if (zoom != last_zoom) {
+        if (last_zoom != 0)
+            zoom_probe_note_gps_z_change(last_zoom, zoom);
+        else
+            zoom_probe_note_gps_z_change(0, zoom);
+        if (smoothpan_zoom_take_committed_flag()) {
+            smoothpan_zoom_on_our_commit(last_zoom, zoom);
+        } else {
+            smoothpan_zoom_on_external_change(last_zoom, zoom);
+        }
     }
     last_zoom = zoom;
     
