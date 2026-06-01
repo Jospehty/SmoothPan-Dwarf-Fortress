@@ -1,3 +1,4 @@
+#include <SDL.h>
 #include "Console.h"
 #include "Core.h"
 #include "DataDefs.h"
