@@ -249,21 +249,44 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             return;
         }
 
-        if (input->count(df::interface_key::CURSOR_UP)) {
-            g_camera.panning_up = true;
+        const bool mmb_held = smoothpan_middle_mouse_button_held();
+        const bool map_scrolling = df::global::game &&
+            df::global::game->main_interface.mouse_scrolling_map;
+        bool mmb_map_grab = false;
+        if (df::global::gps && mmb_held) {
+            int gate_px = df::global::gps->precise_mouse_x;
+            int gate_py = df::global::gps->precise_mouse_y;
+            int raw_x = -1, raw_y = -1;
+            ViewportRect vp;
+            if (smoothpan_raw_sdl_mouse(&raw_x, &raw_y) && get_strict_viewport_rect(&vp)) {
+                gate_px = raw_x - vp.origin_x;
+                gate_py = raw_y - vp.origin_y;
+            }
+            mmb_map_grab = smoothpan_middle_mouse_map_gate(gate_px, gate_py);
+        }
+
+        if (mmb_held && (g_camera.middle_drag_active || map_scrolling || mmb_map_grab)) {
             input->erase(df::interface_key::CURSOR_UP);
-        }
-        if (input->count(df::interface_key::CURSOR_DOWN)) {
-            g_camera.panning_down = true;
             input->erase(df::interface_key::CURSOR_DOWN);
-        }
-        if (input->count(df::interface_key::CURSOR_LEFT)) {
-            g_camera.panning_left = true;
             input->erase(df::interface_key::CURSOR_LEFT);
-        }
-        if (input->count(df::interface_key::CURSOR_RIGHT)) {
-            g_camera.panning_right = true;
             input->erase(df::interface_key::CURSOR_RIGHT);
+        } else {
+            if (input->count(df::interface_key::CURSOR_UP)) {
+                g_camera.panning_up = true;
+                input->erase(df::interface_key::CURSOR_UP);
+            }
+            if (input->count(df::interface_key::CURSOR_DOWN)) {
+                g_camera.panning_down = true;
+                input->erase(df::interface_key::CURSOR_DOWN);
+            }
+            if (input->count(df::interface_key::CURSOR_LEFT)) {
+                g_camera.panning_left = true;
+                input->erase(df::interface_key::CURSOR_LEFT);
+            }
+            if (input->count(df::interface_key::CURSOR_RIGHT)) {
+                g_camera.panning_right = true;
+                input->erase(df::interface_key::CURSOR_RIGHT);
+            }
         }
 
         bool comp = is_enabled && !trace_is_active();
@@ -375,19 +398,25 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
 
     DEFINE_VMETHOD_INTERPOSE(void, logic, ()) {
         bool comp = is_enabled && !trace_is_active();
+        const bool mmb_track = is_enabled && !trace_is_active();
         if (comp) apply_mouse_compensation('l');
         int uncomp_x = -1, uncomp_y = -1;
         if (comp) {
             uncompensated_precise(&uncomp_x, &uncomp_y);
             designation_sync_before_vanilla(uncomp_x, uncomp_y);
         }
+        if (mmb_track)
+            smoothpan_middle_mouse_update();
         INTERPOSE_NEXT(logic)();
         if (comp) {
             uncompensated_precise(&uncomp_x, &uncomp_y);
             designation_sync_after_vanilla(uncomp_x, uncomp_y);
             designation_sync_restore();
-            restore_mouse_compensation();
         }
+        if (mmb_track)
+            smoothpan_middle_mouse_update();
+        if (comp)
+            restore_mouse_compensation();
     }
 
     DEFINE_VMETHOD_INTERPOSE(void, render, (uint32_t unk)) {

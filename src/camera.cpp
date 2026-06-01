@@ -13,10 +13,20 @@
 #include "shift_mode.h"
 #include "ffd_policy.h"
 #include "perf.h"
+#include "viewport.h"
+#include "sdl_hook.h"
 #include <cstdio>
 #include <cstring>
 
 using namespace DFHack;
+
+int g_sp_mmb_held = 0;
+int g_sp_middle_drag = 0;
+int g_sp_mmb_scroll = 0;
+int g_sp_mmb_sticky = 0;
+int g_sp_mmb_gate = 0;
+int g_sp_mmb_dx = 0;
+int g_sp_mmb_dy = 0;
 
 static bool g_frame_minimap_dirty = false;
 static bool g_frame_tile_step = false;
@@ -150,6 +160,8 @@ void SmoothCamera::reset() {
     panning_down = false;
     panning_left = false;
     panning_right = false;
+    middle_drag_active = false;
+    smoothpan_middle_mouse_reset();
     vel_x = 0;
     vel_y = 0;
     overscan_tiles_x = 0;
@@ -165,6 +177,167 @@ static bool is_physical_up_held() { return (GetAsyncKeyState('W') & 0x8000) || (
 static bool is_physical_down_held() { return (GetAsyncKeyState('S') & 0x8000) || (GetAsyncKeyState(VK_DOWN) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD2) & 0x8000); }
 static bool is_physical_left_held() { return (GetAsyncKeyState('A') & 0x8000) || (GetAsyncKeyState(VK_LEFT) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD4) & 0x8000); }
 static bool is_physical_right_held() { return (GetAsyncKeyState('D') & 0x8000) || (GetAsyncKeyState(VK_RIGHT) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD6) & 0x8000); }
+
+bool smoothpan_middle_mouse_button_held() {
+    return (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+}
+
+bool smoothpan_middle_mouse_map_gate(int precise_x, int precise_y) {
+    if (!df::global::gps || precise_x < 0 || precise_y < 0) return false;
+    ViewportRect vp;
+    if (!get_strict_viewport_rect(&vp)) return false;
+    int raw_x = precise_x + vp.origin_x;
+    int raw_y = precise_y + vp.origin_y;
+    if (IsMouseInUI_reason(raw_x, raw_y, nullptr) != 0) return false;
+    if (mouse_over_ui_widget(raw_x, raw_y)) return false;
+    return true;
+}
+
+void SmoothCamera::sync_true_from_window() {
+    if (!df::global::window_x || !df::global::window_y) return;
+    true_x = *df::global::window_x + static_cast<double>(frac_x.load(std::memory_order_relaxed));
+    true_y = *df::global::window_y + static_cast<double>(frac_y.load(std::memory_order_relaxed));
+}
+
+bool SmoothCamera::commit_true_position() {
+    if (!df::global::window_x || !df::global::window_y || !df::global::gps || !df::global::world) return false;
+
+    int half_width_tiles = df::global::gps->main_viewport->dim_x / 8;
+    int half_height_tiles = df::global::gps->main_viewport->dim_y / 8;
+    int min_x = -half_width_tiles;
+    int min_y = -half_height_tiles;
+    int max_x = df::global::world->map.x_count - half_width_tiles;
+    int max_y = df::global::world->map.y_count - half_height_tiles;
+
+    if (true_x < min_x) { true_x = min_x; vel_x = 0; }
+    if (true_x > max_x) { true_x = max_x; vel_x = 0; }
+    if (true_y < min_y) { true_y = min_y; vel_y = 0; }
+    if (true_y > max_y) { true_y = max_y; vel_y = 0; }
+
+    int win_x = *df::global::window_x;
+    int win_y = *df::global::window_y;
+    int new_win_x = static_cast<int>(std::floor(true_x));
+    int new_win_y = static_cast<int>(std::floor(true_y));
+    const bool tile_step = new_win_x != win_x || new_win_y != win_y;
+
+    if (tile_step) {
+        *df::global::window_x = new_win_x;
+        *df::global::window_y = new_win_y;
+        notify_minimap_camera_moved();
+        g_frame_ffd_bump_tile = true;
+        if (df::global::gps->force_full_display_count < 1) {
+            df::global::gps->force_full_display_count = 1;
+        }
+    }
+
+    frac_x.store(static_cast<float>(true_x - std::floor(true_x)), std::memory_order_relaxed);
+    frac_y.store(static_cast<float>(true_y - std::floor(true_y)), std::memory_order_relaxed);
+    return tile_step;
+}
+
+static bool raw_viewport_precise(int* out_px, int* out_py) {
+    int raw_x = -1, raw_y = -1;
+    if (!smoothpan_raw_sdl_mouse(&raw_x, &raw_y)) return false;
+    ViewportRect vp;
+    if (!get_strict_viewport_rect(&vp)) return false;
+    if (out_px) *out_px = raw_x - vp.origin_x;
+    if (out_py) *out_py = raw_y - vp.origin_y;
+    return true;
+}
+
+static bool g_mmb_was_active = false;
+static int g_mmb_anchor_px = -1;
+static int g_mmb_anchor_py = -1;
+static double g_mmb_anchor_true_x = 0.0;
+static double g_mmb_anchor_true_y = 0.0;
+
+static void middle_mouse_end_session() {
+    if (g_mmb_was_active)
+        g_camera.commit_true_position();
+    g_mmb_was_active = false;
+    g_mmb_anchor_px = -1;
+    g_mmb_anchor_py = -1;
+    g_camera.middle_drag_active = false;
+    g_sp_middle_drag = 0;
+}
+
+void smoothpan_middle_mouse_reset() {
+    middle_mouse_end_session();
+}
+
+void smoothpan_middle_mouse_update() {
+    g_sp_mmb_dx = 0;
+    g_sp_mmb_dy = 0;
+    g_sp_mmb_sticky = 0;
+
+    if (!df::global::gps) {
+        middle_mouse_end_session();
+        g_sp_mmb_held = 0;
+        g_sp_mmb_scroll = 0;
+        return;
+    }
+
+    const bool scroll_flag = df::global::game && df::global::game->main_interface.mouse_scrolling_map;
+    const bool mmb = smoothpan_middle_mouse_button_held();
+    g_sp_mmb_held = mmb ? 1 : 0;
+    g_sp_mmb_scroll = scroll_flag ? 1 : 0;
+
+    if (!mmb) {
+        middle_mouse_end_session();
+        return;
+    }
+
+    int px = -1, py = -1;
+    if (!raw_viewport_precise(&px, &py)) {
+        px = df::global::gps->precise_mouse_x;
+        py = df::global::gps->precise_mouse_y;
+    }
+
+    const bool on_map = smoothpan_middle_mouse_map_gate(px, py);
+    g_sp_mmb_gate = on_map ? 1 : 0;
+
+    const bool may_start = on_map || scroll_flag;
+
+    if (!g_mmb_was_active && !may_start) {
+        g_camera.middle_drag_active = false;
+        g_sp_middle_drag = 0;
+        return;
+    }
+
+    if (g_mmb_was_active && !on_map)
+        g_sp_mmb_sticky = 1;
+
+    g_camera.middle_drag_active = true;
+    g_sp_middle_drag = 1;
+    g_camera.vel_x = 0;
+    g_camera.vel_y = 0;
+    g_camera.panning_up = false;
+    g_camera.panning_down = false;
+    g_camera.panning_left = false;
+    g_camera.panning_right = false;
+
+    ViewportRect vp;
+    if (!get_strict_viewport_rect(&vp) || vp.cell_size <= 0) return;
+    const int cell = vp.cell_size;
+
+    if (!g_mmb_was_active) {
+        g_camera.sync_true_from_window();
+        g_mmb_anchor_true_x = g_camera.true_x;
+        g_mmb_anchor_true_y = g_camera.true_y;
+        g_mmb_anchor_px = px;
+        g_mmb_anchor_py = py;
+        g_mmb_was_active = true;
+        g_camera.commit_true_position();
+        return;
+    }
+
+    g_sp_mmb_dx = px - g_mmb_anchor_px;
+    g_sp_mmb_dy = py - g_mmb_anchor_py;
+
+    g_camera.true_x = g_mmb_anchor_true_x - static_cast<double>(g_sp_mmb_dx) / cell;
+    g_camera.true_y = g_mmb_anchor_true_y - static_cast<double>(g_sp_mmb_dy) / cell;
+    g_camera.commit_true_position();
+}
 
 void SmoothCamera::freeze_render_frac() {
     render_frac_x = frac_x.load(std::memory_order_relaxed);
@@ -396,23 +569,39 @@ void SmoothCamera::update() {
     if (!is_physical_down_held()) panning_down = false;
     if (!is_physical_left_held()) panning_left = false;
     if (!is_physical_right_held()) panning_right = false;
-    
+
+    if (smoothpan_middle_mouse_button_held())
+        smoothpan_middle_mouse_update();
+    else
+        smoothpan_middle_mouse_reset();
+
     int win_x = *df::global::window_x;
     int win_y = *df::global::window_y;
     int expected_win_x = static_cast<int>(std::floor(true_x));
     int expected_win_y = static_cast<int>(std::floor(true_y));
     
     if (win_x != expected_win_x || win_y != expected_win_y) {
-        true_x = win_x + static_cast<double>(frac_x.load(std::memory_order_relaxed));
-        true_y = win_y + static_cast<double>(frac_y.load(std::memory_order_relaxed));
-        if (!panning_up && !panning_down && !panning_left && !panning_right) {
-            vel_x = 0;
-            vel_y = 0;
+        if (middle_drag_active) {
+            commit_true_position();
+            win_x = *df::global::window_x;
+            win_y = *df::global::window_y;
+        } else {
+            true_x = win_x + static_cast<double>(frac_x.load(std::memory_order_relaxed));
+            true_y = win_y + static_cast<double>(frac_y.load(std::memory_order_relaxed));
+            if (!panning_up && !panning_down && !panning_left && !panning_right) {
+                vel_x = 0;
+                vel_y = 0;
+            }
         }
         expected_win_x = win_x;
         expected_win_y = win_y;
     }
 
+    int half_width_tiles = df::global::gps->main_viewport->dim_x / 8;
+    int half_height_tiles = df::global::gps->main_viewport->dim_y / 8;
+    bool tile_step = false;
+
+    if (!middle_drag_active) {
     float dx = 0, dy = 0;
     if (panning_up) dy -= 1.0f;
     if (panning_down) dy += 1.0f;
@@ -441,9 +630,6 @@ void SmoothCamera::update() {
     true_x += vel_x * dt;
     true_y += vel_y * dt;
     
-    // dim_x/dim_y are 4x4 text cells; window_x/y are tile coords
-    int half_width_tiles = df::global::gps->main_viewport->dim_x / 8;
-    int half_height_tiles = df::global::gps->main_viewport->dim_y / 8;
     int min_x = -half_width_tiles;
     int min_y = -half_height_tiles;
     int max_x = df::global::world->map.x_count - half_width_tiles;
@@ -456,7 +642,7 @@ void SmoothCamera::update() {
     
     int new_win_x = static_cast<int>(std::floor(true_x));
     int new_win_y = static_cast<int>(std::floor(true_y));
-    const bool tile_step = new_win_x != win_x || new_win_y != win_y;
+    tile_step = new_win_x != win_x || new_win_y != win_y;
 
     if (tile_step) {
         *df::global::window_x = new_win_x;
@@ -471,6 +657,9 @@ void SmoothCamera::update() {
     
     frac_x.store(static_cast<float>(true_x - std::floor(true_x)), std::memory_order_relaxed);
     frac_y.store(static_cast<float>(true_y - std::floor(true_y)), std::memory_order_relaxed);
+    } else {
+        tile_step = g_frame_tile_step;
+    }
 
     // Pan-time ffd>=2: rebake lower-z viewport passes during sub-tile pan when
     // visible terrain can show lower z (cliffs, open air). Smart mode skips on
@@ -481,7 +670,8 @@ void SmoothCamera::update() {
 
         const bool panning = std::abs(fx) > 0.001f || std::abs(fy) > 0.001f ||
                              std::abs(vel_x) > 0.5f || std::abs(vel_y) > 0.5f ||
-                             panning_up || panning_down || panning_left || panning_right;
+                             panning_up || panning_down || panning_left || panning_right ||
+                             middle_drag_active;
 
         if (panning && df::global::window_x && df::global::window_y && df::global::window_z) {
             ffd_policy_ensure_cache(*df::global::window_x, *df::global::window_y,

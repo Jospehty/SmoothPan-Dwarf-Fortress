@@ -95,6 +95,14 @@ extern int g_sp_gate_unified_inui;
 extern int g_sp_gate_mismatch;
 extern int g_sp_gate_pick_x, g_sp_gate_pick_y;
 
+extern int g_sp_mmb_held;
+extern int g_sp_middle_drag;
+extern int g_sp_mmb_scroll;
+extern int g_sp_mmb_sticky;
+extern int g_sp_mmb_gate;
+extern int g_sp_mmb_dx;
+extern int g_sp_mmb_dy;
+
 extern int g_sp_desig_active;
 extern int g_sp_desig_paint;
 extern int g_sp_desig_drag;
@@ -653,6 +661,9 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                             g_sp_comp_sx, g_sp_comp_sy,
                             g_sp_comp_mx_before, g_sp_comp_mx_after,
                             g_sp_comp_my_before, g_sp_comp_my_after);
+                    fprintf(f, "  mmb held=%d drag=%d scroll=%d gate=%d sticky=%d anchor_delta=(%d,%d)\n",
+                            g_sp_mmb_held, g_sp_middle_drag, g_sp_mmb_scroll,
+                            g_sp_mmb_gate, g_sp_mmb_sticky, g_sp_mmb_dx, g_sp_mmb_dy);
                     fprintf(f, "  desig active=%d paint=%d drag=%d patched_mx,my=(%d,%d) mpos=(%d,%d) "
                                "sel start=(%d,%d,%d) end=(%d,%d,%d)\n",
                             g_sp_desig_active, g_sp_desig_paint, g_sp_desig_drag,

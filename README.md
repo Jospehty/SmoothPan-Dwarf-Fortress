@@ -4,7 +4,9 @@ Smooth sub-tile WASD camera panning for **Dwarf Fortress Premium** (DF 50.x), im
 
 The game continues to simulate on integer tile coordinates (`window_x` / `window_y`). Sub-pixel motion is applied only at render time by shifting map SDL blits. Mouse input is compensated so designation, hover, and UI clicks stay aligned with what you see on screen.
 
-**Latest release: [v1.0.0](releases/v1.0.0/)** (plugin build 3.11.46) — first public release; pan, mouse sync, and mining designation verified.
+**Latest release: [v1.1.0](releases/v1.1.0/)** (plugin build 3.11.52) — adds smooth middle-mouse grab-pan; WASD and designation unchanged from v1.0.0.
+
+Previous: [v1.0.0](releases/v1.0.0/) (3.11.46)
 
 ---
 
@@ -27,7 +29,7 @@ C:\Program Files (x86)\Steam\steamapps\common\Dwarf Fortress\
 
 ### 2. Drop in SmoothPan
 
-1. Download [`smoothpan.plug.dll`](releases/v1.0.0/smoothpan.plug.dll) from this repo (or grab the whole [v1.0.0](releases/v1.0.0/) folder).
+1. Download [`smoothpan.plug.dll`](releases/v1.1.0/smoothpan.plug.dll) from this repo (or grab the whole [v1.1.0](releases/v1.1.0/) folder).
 2. Copy it to:
 
 ```
@@ -54,10 +56,10 @@ enable smoothpan
 You should see:
 
 ```
-SmoothPan 3.11.46 enabled
+SmoothPan 3.11.52 enabled
 ```
 
-Enter a fortress and pan with **WASD** (or arrow keys).
+Enter a fortress and pan with **WASD** (or arrow keys) or **middle-mouse drag** on the map.
 
 ### Optional — auto-load every session
 
@@ -78,7 +80,7 @@ Replace `hack\plugins\smoothpan.plug.dll`, then `plugin load smoothpan` / `enabl
 
 To uninstall: unload the plugin and delete `smoothpan.plug.dll` from `hack\plugins\`.
 
-More detail: [releases/v1.0.0/INSTALL.txt](releases/v1.0.0/INSTALL.txt)
+More detail: [releases/v1.1.0/INSTALL.txt](releases/v1.1.0/INSTALL.txt)
 
 ---
 
@@ -86,7 +88,7 @@ More detail: [releases/v1.0.0/INSTALL.txt](releases/v1.0.0/INSTALL.txt)
 
 | Feature | Description |
 |---------|-------------|
-| **Smooth pan** | WASD / arrow keys pan with fractional tile motion at full refresh rate |
+| **Smooth pan** | WASD / arrow keys and middle-mouse map drag with fractional tile motion |
 | **Stable HUD** | Toolbar, panels, and overlays stay fixed while the map shifts underneath |
 | **Mouse sync** | World picks, mining designation drag, and UI clicks while panned |
 | **Multi-z alignment** | Lower-z show-through and off-map passes shift with the main map |
@@ -100,6 +102,7 @@ More detail: [releases/v1.0.0/INSTALL.txt](releases/v1.0.0/INSTALL.txt)
 | Input | Action |
 |-------|--------|
 | **WASD** / arrow keys | Smooth camera pan |
+| **Middle mouse drag** (on map) | Smooth grab-pan (same camera as WASD) |
 | **F7** | Detailed perf capture (~450 frames → log file) |
 | **F8** | Debug: toggle GPS ↔ both mouse layers |
 | **F9** | Telemetry dump (blits, mouse, shift) |
@@ -108,7 +111,7 @@ More detail: [releases/v1.0.0/INSTALL.txt](releases/v1.0.0/INSTALL.txt)
 
 ---
 
-## Default behavior (v1.0.0 / build 3.11.46)
+## Default behavior (v1.1.0 / build 3.11.52)
 
 | Subsystem | Default | Notes |
 |-----------|---------|-------|

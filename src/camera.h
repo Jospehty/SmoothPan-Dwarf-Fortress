@@ -50,6 +50,7 @@ struct SmoothCamera {
     bool panning_down = false;
     bool panning_left = false;
     bool panning_right = false;
+    bool middle_drag_active = false;
 
     int overscan_tiles_x = 0;
     int overscan_tiles_y = 0;
@@ -79,9 +80,25 @@ struct SmoothCamera {
     int pixel_shift_y() const;
     int gap_shift_x() const;
     int gap_shift_y() const;
+
+    void sync_true_from_window();
+    bool commit_true_position();
 };
 
 extern SmoothCamera g_camera;
+
+extern int g_sp_mmb_held;
+extern int g_sp_middle_drag;
+extern int g_sp_mmb_scroll;
+extern int g_sp_mmb_sticky;
+extern int g_sp_mmb_gate;
+extern int g_sp_mmb_dx;
+extern int g_sp_mmb_dy;
+
+bool smoothpan_middle_mouse_button_held();
+bool smoothpan_middle_mouse_map_gate(int precise_x, int precise_y);
+void smoothpan_middle_mouse_update();
+void smoothpan_middle_mouse_reset();
 
 void smoothpan_set_minimap_full_rebuild(bool full);
 bool smoothpan_minimap_full_rebuild();
