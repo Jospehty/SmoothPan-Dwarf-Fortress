@@ -7,8 +7,10 @@
 #include "probe.h"
 #include "trace.h"
 #include "shift_mode.h"
+#include "mouse_comp.h"
 #include "frame_seq.h"
 #include "renderer_hook.h"
+#include "perf.h"
 #include "VTableInterpose.h"
 #include "MinHook.h"
 #include <SDL.h>
@@ -35,8 +37,6 @@ typedef int(*SDL_RenderCopyF_t)(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, co
 typedef int(*SDL_RenderCopyExF_t)(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_FRect*, const double, const SDL_FPoint*, const SDL_RendererFlip);
 typedef int(*SDL_GetRendererOutputSize_t)(SDL_Renderer*, int*, int*);
 typedef void(*SDL_RenderPresent_t)(SDL_Renderer*);
-typedef int(*SDL_PollEvent_t)(SDL_Event*);
-typedef int(*SDL_PeepEvents_t)(SDL_Event*, int, SDL_eventaction, Uint32, Uint32);
 typedef uint32_t(*SDL_GetMouseState_t)(int*, int*);
 typedef uint32_t(*SDL_GetGlobalMouseState_t)(int*, int*);
 typedef int(*SDL_RenderSetClipRect_t)(SDL_Renderer*, const SDL_Rect*);
@@ -49,8 +49,6 @@ SDL_RenderCopyF_t True_SDL_RenderCopyF = nullptr;
 SDL_RenderCopyExF_t True_SDL_RenderCopyExF = nullptr;
 SDL_GetRendererOutputSize_t GetRendererOutputSize_func = nullptr;
 SDL_RenderPresent_t True_SDL_RenderPresent = nullptr;
-SDL_PollEvent_t True_SDL_PollEvent = nullptr;
-SDL_PeepEvents_t True_SDL_PeepEvents = nullptr;
 SDL_GetMouseState_t GetMouseState_func = nullptr;
 SDL_GetGlobalMouseState_t GetGlobalMouseState_func = nullptr;
 SDL_RenderSetClipRect_t True_SDL_RenderSetClipRect = nullptr;
@@ -74,9 +72,49 @@ std::string g_telemetry_log;
 
 extern bool &is_enabled;
 
+// Mouse-compensation diagnostics (defined in smoothpan.cpp).
+extern int g_sp_comp_reason_feed;
+extern int g_sp_comp_reason_rend;
+extern int g_sp_comp_feed_calls;
+extern int g_sp_comp_rend_calls;
+extern int g_sp_comp_sx, g_sp_comp_sy;
+extern int g_sp_comp_mx_before, g_sp_comp_mx_after;
+extern int g_sp_comp_my_before, g_sp_comp_my_after;
+extern int g_sp_comp_raw_x, g_sp_comp_raw_y;
+extern int g_click_count, g_click_reason, g_click_keys;
+extern int g_click_raw_x, g_click_raw_y;
+extern int g_click_mx_before, g_click_mx_after;
+extern int g_click_shift_x, g_click_shift_y;
+extern int g_click_inui_reason;
+extern int g_click_vp_left, g_click_vp_top, g_click_vp_right, g_click_vp_bottom;
+extern int g_click_w_x1, g_click_w_y1, g_click_w_x2, g_click_w_y2;
+extern int g_click_w_container;
 
+extern int g_sp_gate_sdl_inui;
+extern int g_sp_gate_unified_inui;
+extern int g_sp_gate_mismatch;
+extern int g_sp_gate_pick_x, g_sp_gate_pick_y;
+
+extern int g_sp_desig_active;
+extern int g_sp_desig_paint;
+extern int g_sp_desig_drag;
+extern int g_sp_desig_patched_mx, g_sp_desig_patched_my;
+extern int g_sp_desig_sel_sx, g_sp_desig_sel_sy, g_sp_desig_sel_sz;
+extern int g_sp_desig_sel_ex, g_sp_desig_sel_ey, g_sp_desig_sel_ez;
+extern int g_sp_desig_mpos_x, g_sp_desig_mpos_y;
+
+struct SpClickRec {
+    int n, rawx, rawy, reason, inui;
+    int sx, sy, mxb, mxa, myb, mya, px, py;
+    int mz, bm, scroll;
+    int cell, fsx100, fsy100, tx, ty;
+    int gapx, gapy, tpx;
+    int ex, ey, ex_t, ey_t, cx, cy, dx, dy;
+    int gate_sdl, gate_unified;
+};
 static const int SP_CLICK_RING = 6;
-
+extern SpClickRec g_click_ring[SP_CLICK_RING];
+extern int g_click_ring_pos;
 
 static bool sdl_shift_mode_active();
 
@@ -112,81 +150,45 @@ void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
     True_SDL_RenderSetClipRect(r, &clip);
 }
 
-static bool should_spoof_mouse(int x, int y, int* shift_x, int* shift_y) {
-    if (!is_enabled || g_shift_mode == ShiftMode::None) return false;
-    
-    float sx_f = g_camera.last_snapshot.shift_x;
-    float sy_f = g_camera.last_snapshot.shift_y;
-    if (sx_f == 0.0f && sy_f == 0.0f) return false;
-
-    if (IsMouseInUI(x, y)) return false;
-
-    if (shift_x) *shift_x = static_cast<int>(std::lround(sx_f));
-    if (shift_y) *shift_y = static_cast<int>(std::lround(sy_f));
-    return true;
+static void apply_mouse_shift(int& mx, int& my) {
+    // The ONLY correction sub-tile panning needs is to undo the visual pixel
+    // shift applied to the map tiles, so the cursor maps to the tile actually
+    // drawn under it.  The previous static (screen_x - origin_x) term added a
+    // constant ~18px offset to every query, double-compensating and scaling
+    // badly with zoom (the "off by a few tiles" desync).  Removed.
+    mx += static_cast<int>(std::lround(g_camera.render_shift_x()));
+    my += static_cast<int>(std::lround(g_camera.render_shift_y()));
 }
 
 static void compensate_mouse(int* x, int* y) {
-    if (!x || !y) return;
-    int sx, sy;
-    if (should_spoof_mouse(*x, *y, &sx, &sy)) {
-        *x += sx;
-        *y += sy;
-    }
-}
+    if (!x || !y || !is_enabled) return;
+    if (!mouse_comp_sdl_enabled()) return;
+    if (g_shift_mode == ShiftMode::None) return;
 
+    int pick_x = 0, pick_y = 0;
+    map_pick_screen_for_gate(*x, *y, &pick_x, &pick_y);
+    g_sp_gate_pick_x = pick_x;
+    g_sp_gate_pick_y = pick_y;
 
-int Hook_SDL_PollEvent(SDL_Event* event) {
-    g_camera.sync_logic_window();
-    int ret = True_SDL_PollEvent(event);
-    if (ret && event) {
-        int sx, sy;
-        if (event->type == SDL_MOUSEMOTION) {
-            if (should_spoof_mouse(event->motion.x, event->motion.y, &sx, &sy)) {
-                event->motion.x += sx;
-                event->motion.y += sy;
-            }
-        } else if (event->type == SDL_MOUSEBUTTONDOWN || event->type == SDL_MOUSEBUTTONUP) {
-            if (should_spoof_mouse(event->button.x, event->button.y, &sx, &sy)) {
-                event->button.x += sx;
-                event->button.y += sy;
-            }
-        }
-    }
-    return ret;
-}
+    int unified_inui = 0;
+    bool compensate = mouse_gate_should_compensate(pick_x, pick_y, &unified_inui);
+    g_sp_gate_unified_inui = unified_inui;
 
-int Hook_SDL_PeepEvents(SDL_Event* events, int numevents, SDL_eventaction action, Uint32 minType, Uint32 maxType) {
-    g_camera.sync_logic_window();
-    int ret = True_SDL_PeepEvents(events, numevents, action, minType, maxType);
-    if (ret > 0 && events && action == SDL_GETEVENT) {
-        for (int i = 0; i < ret; ++i) {
-            int sx, sy;
-            if (events[i].type == SDL_MOUSEMOTION) {
-                if (should_spoof_mouse(events[i].motion.x, events[i].motion.y, &sx, &sy)) {
-                    events[i].motion.x += sx;
-                    events[i].motion.y += sy;
-                }
-            } else if (events[i].type == SDL_MOUSEBUTTONDOWN || events[i].type == SDL_MOUSEBUTTONUP) {
-                if (should_spoof_mouse(events[i].button.x, events[i].button.y, &sx, &sy)) {
-                    events[i].button.x += sx;
-                    events[i].button.y += sy;
-                }
-            }
-        }
-    }
-    return ret;
+    int sdl_inui = IsMouseInUI_reason(*x, *y, nullptr);
+    g_sp_gate_sdl_inui = sdl_inui;
+    g_sp_gate_mismatch = (sdl_inui != unified_inui) ? 1 : 0;
+
+    if (!compensate) return;
+    apply_mouse_shift(*x, *y);
 }
 
 uint32_t Hook_SDL_GetMouseState(int* x, int* y) {
-    g_camera.sync_logic_window();
     uint32_t state = GetMouseState_func(x, y);
     compensate_mouse(x, y);
     return state;
 }
 
 uint32_t Hook_SDL_GetGlobalMouseState(int* x, int* y) {
-    g_camera.sync_logic_window();
     uint32_t state = GetGlobalMouseState_func(x, y);
     compensate_mouse(x, y);
     return state;
@@ -313,7 +315,15 @@ static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
                            const SDL_FRect* shifted);
 
 static bool should_shift_blit(const BlitClassification& c) {
-    return c.cls == BlitClass::Map;
+    if (c.cls != BlitClass::Map) return false;
+    // Post-viewport compositing (vmap=0) draws HUD sprites after the bake:
+    // 168×168 portraits, 56×56 moon, etc.  Only grid-aligned map tiles belong
+    // here (lower-z show-through); everything else must stay fixed.
+    if (g_in_post_viewport_map_shift.load(std::memory_order_relaxed) &&
+        !g_in_main_viewport_update.load(std::memory_order_relaxed)) {
+        return c.tile_sized && c.tile_aligned;
+    }
+    return true;
 }
 
 static void record_blit_counters(const BlitClassification& c, bool shifted) {
@@ -353,11 +363,13 @@ static void log_blit_telemetry(const BlitClassification& c, int x, int y, int w,
     if (g_test_dump_frames > 0 && g_test_dump_delay == 0) {
         char buf[384];
         snprintf(buf, sizeof(buf),
-                 "Blit: dst=(%d,%d,%d,%d) pass=%d vpass=%d vmap=%d shifted=%d in_ui=%d tile=%d align=%d suspect=%d\n",
+                 "Blit: dst=(%d,%d,%d,%d) pass=%d vpass=%d vmap=%d vpscr=(%d,%d) shifted=%d in_ui=%d tile=%d align=%d suspect=%d\n",
                  x, y, w, h,
                  g_in_map_pass.load(std::memory_order_relaxed) ? 1 : 0,
                  g_viewport_pass_index.load(std::memory_order_relaxed),
                  g_cur_pass_is_map.load(std::memory_order_relaxed) ? 1 : 0,
+                 g_cur_pass_screen_x.load(std::memory_order_relaxed),
+                 g_cur_pass_screen_y.load(std::memory_order_relaxed),
                  shifted ? 1 : 0,
                  c.in_ui, c.tile_sized, c.tile_aligned, c.suspected_hud_false_positive);
         g_telemetry_log += buf;
@@ -403,40 +415,92 @@ static void note_frame_blit(int x, int y, int w, int h) {
     }
 }
 
-static bool process_map_blit(int x, int y, int w, int h, int* out_x, int* out_y) {
-    if (trace_is_active()) return false;
-    if (!is_enabled || !sdl_shift_mode_active()) return false;
-    if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) return false;
-    // Only shift blits issued during the main map viewport update.  This
-    // precisely excludes UI overlays, info-panel icons, toolbar passes, etc.
-    if (!g_in_main_viewport_update.load(std::memory_order_relaxed)) return false;
+static bool map_shift_gate_active() {
+    return g_in_main_viewport_update.load(std::memory_order_relaxed) ||
+           g_in_post_viewport_map_shift.load(std::memory_order_relaxed);
+}
 
+static bool process_map_blit(int x, int y, int w, int h, int* out_x, int* out_y) {
+    LARGE_INTEGER q0, q1, q_cls, freq;
+    const bool time_it = perf_is_active();
+    if (time_it) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&q0);
+    }
+
+    auto finish = [&](bool shifted, double classify_us) {
+        if (time_it) {
+            QueryPerformanceCounter(&q1);
+            double total_us = (q1.QuadPart - q0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+            perf_note_blit_hook(shifted, classify_us, total_us);
+        }
+    };
+
+    if (trace_is_active()) { finish(false, 0); return false; }
+    if (!is_enabled || !sdl_shift_mode_active()) { finish(false, 0); return false; }
+    if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) { finish(false, 0); return false; }
+    if (!map_shift_gate_active()) { finish(false, 0); return false; }
+
+    if (time_it) QueryPerformanceCounter(&q_cls);
     BlitClassification c = classify_blit(x, y, w, h);
+    double classify_us = 0;
+    if (time_it) {
+        QueryPerformanceCounter(&q1);
+        classify_us = (q1.QuadPart - q_cls.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+    }
+
     bool shifted = should_shift_blit(c);
     record_blit_counters(c, shifted);
     log_blit_telemetry(c, x, y, w, h, shifted);
 
-    if (!shifted) return false;
+    if (!shifted) {
+        finish(false, classify_us);
+        return false;
+    }
 
     *out_x = x - static_cast<int>(std::lround(g_camera.render_shift_x()));
     *out_y = y - static_cast<int>(std::lround(g_camera.render_shift_y()));
+    finish(true, classify_us);
     return true;
 }
 
 static bool process_map_blit_f(float x, float y, float w, float h) {
-    if (trace_is_active()) return false;
-    if (!is_enabled || !sdl_shift_mode_active()) return false;
-    if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) return false;
-    if (!g_in_main_viewport_update.load(std::memory_order_relaxed)) return false;
+    LARGE_INTEGER q0, q1, q_cls, freq;
+    const bool time_it = perf_is_active();
+    if (time_it) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&q0);
+    }
+
+    auto finish = [&](bool shifted, double classify_us) {
+        if (time_it) {
+            QueryPerformanceCounter(&q1);
+            double total_us = (q1.QuadPart - q0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+            perf_note_blit_hook(shifted, classify_us, total_us);
+        }
+    };
+
+    if (trace_is_active()) { finish(false, 0); return false; }
+    if (!is_enabled || !sdl_shift_mode_active()) { finish(false, 0); return false; }
+    if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) { finish(false, 0); return false; }
+    if (!map_shift_gate_active()) { finish(false, 0); return false; }
 
     int ix = static_cast<int>(std::floor(x));
     int iy = static_cast<int>(std::floor(y));
     int iw = static_cast<int>(std::ceil(w));
     int ih = static_cast<int>(std::ceil(h));
+    if (time_it) QueryPerformanceCounter(&q_cls);
     BlitClassification c = classify_blit(ix, iy, iw, ih);
+    double classify_us = 0;
+    if (time_it) {
+        QueryPerformanceCounter(&q1);
+        classify_us = (q1.QuadPart - q_cls.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+    }
     bool shifted = should_shift_blit(c);
     record_blit_counters(c, shifted);
     log_blit_telemetry_f(c, x, y, w, h, shifted);
+    if (g_probe_frames > 0) probe_accumulate_blit(c, shifted);
+    finish(shifted, classify_us);
     return shifted;
 }
 
@@ -538,7 +602,7 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                     ? 100.0f * static_cast<float>(g_frame_sprite_shifted) / static_cast<float>(g_frame_sprite_total)
                     : 0.0f;
 
-                fprintf(f, "SMOOTHPAN_%s frame=%d fx=%.3f fy=%.3f shift=(%.2f,%.2f) px=(%d,%d) overscan=(%d,%d) os_act=%d reason=%s mode=%s\n",
+                fprintf(f, "SMOOTHPAN_%s frame=%d fx=%.3f fy=%.3f shift=(%.2f,%.2f) px=(%d,%d) overscan=(%d,%d) os_act=%d reason=%s mode=%s mouse=%s\n",
                         SMOOTHPAN_BUILD_VERSION,
                         g_test_dump_frames > 0 ? g_test_dump_frames : g_classify_log_frames,
                         snap.frac_x, snap.frac_y,
@@ -547,7 +611,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                         log_overscan_x, log_overscan_y,
                         snap.overscan_active ? 1 : 0,
                         snap.overscan_reason,
-                        shift_mode_name(g_shift_mode));
+                        shift_mode_name(g_shift_mode),
+                        mouse_comp_effective_name());
                 if (g_test_dump_frames > 0 && df::global::gps && df::global::gps->main_map_port) {
                     auto* mp = df::global::gps->main_map_port;
                     fprintf(f, "  map_port pixel_perc=(%d,%d) dim=(%d,%d)\n",
@@ -566,6 +631,9 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                         if (r2d) { origin_x = r2d->origin_x; origin_y = r2d->origin_y; }
                     }
                     ViewportRect mvp; get_strict_viewport_rect(&mvp);
+                    int origin_precise_x = df::global::gps->precise_mouse_x + origin_x;
+                    int origin_precise_y = df::global::gps->precise_mouse_y + origin_y;
+                    int sdl_match = (rawx == origin_precise_x && rawy == origin_precise_y) ? 1 : 0;
                     fprintf(f, "  mouse raw_sdl=(%d,%d) df_tile=(%d,%d) df_precise=(%d,%d) "
                                "shift=(%.2f,%.2f) origin=(%d,%d) screen=(%d,%d) cell=%d\n",
                             rawx, rawy,
@@ -573,8 +641,59 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                             df::global::gps->precise_mouse_x, df::global::gps->precise_mouse_y,
                             g_camera.render_shift_x(), g_camera.render_shift_y(),
                             origin_x, origin_y, mvp.left, mvp.top, mvp.cell_size);
-                    
-                                    }
+                    fprintf(f, "  mouse origin+precise=(%d,%d) sdl_match=%d gate pick=(%d,%d) "
+                               "inui sdl=%d unified=%d mismatch=%d\n",
+                            origin_precise_x, origin_precise_y, sdl_match,
+                            g_sp_gate_pick_x, g_sp_gate_pick_y,
+                            g_sp_gate_sdl_inui, g_sp_gate_unified_inui, g_sp_gate_mismatch);
+                    fprintf(f, "  comp feed=%d/%dcalls rend=%d/%dcalls sx,sy=(%d,%d) "
+                               "mx %d->%d my %d->%d\n",
+                            g_sp_comp_reason_feed, g_sp_comp_feed_calls,
+                            g_sp_comp_reason_rend, g_sp_comp_rend_calls,
+                            g_sp_comp_sx, g_sp_comp_sy,
+                            g_sp_comp_mx_before, g_sp_comp_mx_after,
+                            g_sp_comp_my_before, g_sp_comp_my_after);
+                    fprintf(f, "  desig active=%d paint=%d drag=%d patched_mx,my=(%d,%d) mpos=(%d,%d) "
+                               "sel start=(%d,%d,%d) end=(%d,%d,%d)\n",
+                            g_sp_desig_active, g_sp_desig_paint, g_sp_desig_drag,
+                            g_sp_desig_patched_mx, g_sp_desig_patched_my,
+                            g_sp_desig_mpos_x, g_sp_desig_mpos_y,
+                            g_sp_desig_sel_sx, g_sp_desig_sel_sy, g_sp_desig_sel_sz,
+                            g_sp_desig_sel_ex, g_sp_desig_sel_ey, g_sp_desig_sel_ez);
+                    fprintf(f, "  lastclick #%d keys=%d reason=%d raw=(%d,%d) "
+                               "shift=(%d,%d) mx %d->%d inui=%d vp=[%d,%d..%d,%d] "
+                               "wdg=%s[%d,%d..%d,%d]\n",
+                            g_click_count, g_click_keys, g_click_reason,
+                            g_click_raw_x, g_click_raw_y,
+                            g_click_shift_x, g_click_shift_y,
+                            g_click_mx_before, g_click_mx_after,
+                            g_click_inui_reason,
+                            g_click_vp_left, g_click_vp_top,
+                            g_click_vp_right, g_click_vp_bottom,
+                            g_click_w_container ? "C" : "L",
+                            g_click_w_x1, g_click_w_y1,
+                            g_click_w_x2, g_click_w_y2);
+                    for (int ri = 0; ri < SP_CLICK_RING; ++ri) {
+                        int idx = (g_click_ring_pos - 1 - ri + SP_CLICK_RING * 2) % SP_CLICK_RING;
+                        const SpClickRec& rc = g_click_ring[idx];
+                        if (rc.n == 0) continue;
+                        fprintf(f, "    click#%d reason=%d inui=%d raw=(%d,%d) "
+                                   "precise=(%d,%d) cell=%d tpx=%d gap=(%d,%d) "
+                                   "fshift=(%.2f,%.2f) mx %d->%d / %d->%d tile=(%d,%d) "
+                                   "expected=(%d,%d) trunc=(%d,%d) cursor=(%d,%d) delta=(%d,%d) "
+                                   "gate sdl=%d unified=%d "
+                                   "mzone=%d bmode=%d scroll=%d\n",
+                                rc.n, rc.reason, rc.inui, rc.rawx, rc.rawy,
+                                rc.px, rc.py, rc.cell, rc.tpx, rc.gapx, rc.gapy,
+                                rc.fsx100 / 100.0, rc.fsy100 / 100.0,
+                                rc.mxb, rc.mxa, rc.myb, rc.mya,
+                                rc.tx, rc.ty,
+                                rc.ex, rc.ey, rc.ex_t, rc.ey_t,
+                                rc.cx, rc.cy, rc.dx, rc.dy,
+                                rc.gate_sdl, rc.gate_unified,
+                                rc.mz, rc.bm, rc.scroll);
+                    }
+                }
                 fprintf(f, "  blits=%d shifted=%d pass_shift=%d ui_leak=%d map=%d/%d (%.1f%%) tile=%d/%d (%.1f%%) sprite=%d/%d (%.1f%%) log=%s\n",
                         g_frame_blit_total, g_frame_blit_shifted,
                         g_frame_pass_shifted, g_frame_ui_leak_shifted,
@@ -619,6 +738,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     frame_seq_on_present();
     renderer_hook_on_present();
     g_in_map_pass.store(false, std::memory_order_relaxed);
+
+    perf_on_present(is_enabled);
 
     True_SDL_RenderPresent(renderer);
 }
@@ -743,6 +864,13 @@ static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
 
     if (!is_last_col && !is_last_row) return;
 
+    LARGE_INTEGER edge_t0, edge_t1, edge_freq;
+    const bool time_edge = perf_is_active();
+    if (time_edge) {
+        QueryPerformanceFrequency(&edge_freq);
+        QueryPerformanceCounter(&edge_t0);
+    }
+
     // Right gap: [tile_right - sx_r, vp.right] × [shifted_y, shifted_y + cell]
     if (is_last_col) {
         float gap_x = tile_right - sx_r;
@@ -785,6 +913,12 @@ static void fill_edge_gap(SDL_Renderer* renderer, SDL_Texture* texture,
             SDL_FRect dst = { gap_x, gap_y, gap_w, gap_h };
             True_SDL_RenderCopyF(renderer, texture, srcrect, &dst);
         }
+    }
+
+    if (time_edge) {
+        QueryPerformanceCounter(&edge_t1);
+        double us = (edge_t1.QuadPart - edge_t0.QuadPart) * 1e6 / static_cast<double>(edge_freq.QuadPart);
+        perf_note_edge_fill(us);
     }
 }
 
@@ -847,8 +981,6 @@ bool InitSDLHooks() {
     void* render_copy_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopy");
     void* render_copy_ex_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyEx");
     void* render_present_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderPresent");
-    void* poll_event_addr = (void*)GetProcAddress(sdl_module, "SDL_PollEvent");
-    void* peep_events_addr = (void*)GetProcAddress(sdl_module, "SDL_PeepEvents");
     void* get_mouse_state_addr = (void*)GetProcAddress(sdl_module, "SDL_GetMouseState");
     void* get_global_mouse_state_addr = (void*)GetProcAddress(sdl_module, "SDL_GetGlobalMouseState");
     void* render_set_clip_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderSetClipRect");
@@ -872,8 +1004,6 @@ bool InitSDLHooks() {
     if (render_copy_f_addr) MH_CreateHook(render_copy_f_addr, &Hook_SDL_RenderCopyF, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopyF));
     if (render_copy_ex_f_addr) MH_CreateHook(render_copy_ex_f_addr, &Hook_SDL_RenderCopyExF, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopyExF));
     if (render_present_addr) MH_CreateHook(render_present_addr, &Hook_SDL_RenderPresent, reinterpret_cast<LPVOID*>(&True_SDL_RenderPresent));
-    if (poll_event_addr) MH_CreateHook(poll_event_addr, &Hook_SDL_PollEvent, reinterpret_cast<LPVOID*>(&True_SDL_PollEvent));
-    if (peep_events_addr) MH_CreateHook(peep_events_addr, &Hook_SDL_PeepEvents, reinterpret_cast<LPVOID*>(&True_SDL_PeepEvents));
     if (get_mouse_state_addr) MH_CreateHook(get_mouse_state_addr, &Hook_SDL_GetMouseState, reinterpret_cast<LPVOID*>(&GetMouseState_func));
     if (get_global_mouse_state_addr) MH_CreateHook(get_global_mouse_state_addr, &Hook_SDL_GetGlobalMouseState, reinterpret_cast<LPVOID*>(&GetGlobalMouseState_func));
     if (render_set_clip_addr) MH_CreateHook(render_set_clip_addr, &Hook_SDL_RenderSetClipRect, reinterpret_cast<LPVOID*>(&True_SDL_RenderSetClipRect));
@@ -881,6 +1011,12 @@ bool InitSDLHooks() {
     if (render_set_viewport_addr) MH_CreateHook(render_set_viewport_addr, &Hook_SDL_RenderSetViewport, reinterpret_cast<LPVOID*>(&True_SDL_RenderSetViewport));
 
     MH_EnableHook(MH_ALL_HOOKS);
+    return true;
+}
+
+bool smoothpan_raw_sdl_mouse(int* x, int* y) {
+    if (!GetMouseState_func || !x || !y) return false;
+    GetMouseState_func(x, y);
     return true;
 }
 
