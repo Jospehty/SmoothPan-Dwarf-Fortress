@@ -1,6 +1,6 @@
 # SmoothPan — Project Status
 
-**Release: 3.11.46** — functional plugin, user-verified for normal play.
+**Release: v1.0.0** (plugin build **3.11.46**) — first public release, user-verified for normal play.
 
 This document is the handoff / status summary for contributors and future sessions.
 
@@ -53,6 +53,7 @@ This document is the handoff / status summary for contributors and future sessio
 | 3.11.43 | Revert to GPS-only; designation still desynced |
 | 3.11.44–45 | Designation-only `mouse_x/y` + `selection_rect` sync; mining fixed, UI regressed |
 | **3.11.46** | **Live-drag gating + strict UI gate — mining + UI both verified** |
+| **v1.0.0** | **First public GitHub release (ships 3.11.46 DLL)** |
 
 Pre-3.11 history (shift formula `z/4`, SDL-only mode, overscan removal): see [PIPELINE.md](PIPELINE.md).
 

@@ -1,0 +1,39 @@
+SmoothPan v1.0.0 (plugin build 3.11.46)
+======================================
+
+Requirements
+  - Dwarf Fortress Premium (Steam), DF 50.x
+  - DFHack for the SAME game version (https://github.com/DFHack/dfhack/releases)
+  - Windows (64-bit)
+
+Install (copy one file)
+  1. Copy smoothpan.plug.dll to:
+       {Your Dwarf Fortress folder}\hack\plugins\smoothpan.plug.dll
+
+     Steam default:
+       C:\Program Files (x86)\Steam\steamapps\common\Dwarf Fortress\hack\plugins\
+
+  2. Launch DF with DFHack (DFHack launcher or hack\launch.bat).
+
+  3. In the DFHack console:
+       plugin load smoothpan
+       enable smoothpan
+
+     You should see: SmoothPan 3.11.46 enabled
+
+  4. Enter a fortress. Pan with WASD.
+
+Optional — load automatically
+  Add to dfhack-config\init\dfhack.init (or onMapLoad.init):
+       plugin load smoothpan
+       enable smoothpan
+
+Updating
+  plugin unload smoothpan
+  Replace hack\plugins\smoothpan.plug.dll
+  plugin load smoothpan
+  enable smoothpan
+
+Uninstall
+  plugin unload smoothpan
+  Delete hack\plugins\smoothpan.plug.dll

@@ -4,7 +4,81 @@ Smooth sub-tile WASD camera panning for **Dwarf Fortress Premium** (DF 50.x), im
 
 The game continues to simulate on integer tile coordinates (`window_x` / `window_y`). Sub-pixel motion is applied only at render time by shifting map SDL blits. Mouse input is compensated so designation, hover, and UI clicks stay aligned with what you see on screen.
 
-**Current release: 3.11.46** — functional for normal play; user-verified pan, mouse sync, mining designation, and UI clicks.
+**Latest release: [v1.0.0](releases/v1.0.0/)** (plugin build 3.11.46) — first public release; pan, mouse sync, and mining designation verified.
+
+---
+
+## Install (Windows — copy one file)
+
+You need **two things**: DFHack (for your exact DF version) and the SmoothPan plugin DLL.
+
+### 1. Install DFHack
+
+If you do not already have it:
+
+1. Download [DFHack](https://github.com/DFHack/dfhack/releases) for your **exact** Dwarf Fortress version.
+2. Follow the DFHack install instructions so `hack/` exists inside your game folder.
+
+Steam default game path:
+
+```
+C:\Program Files (x86)\Steam\steamapps\common\Dwarf Fortress\
+```
+
+### 2. Drop in SmoothPan
+
+1. Download [`smoothpan.plug.dll`](releases/v1.0.0/smoothpan.plug.dll) from this repo (or grab the whole [v1.0.0](releases/v1.0.0/) folder).
+2. Copy it to:
+
+```
+{Your Dwarf Fortress folder}\hack\plugins\smoothpan.plug.dll
+```
+
+Example (Steam):
+
+```
+C:\Program Files (x86)\Steam\steamapps\common\Dwarf Fortress\hack\plugins\smoothpan.plug.dll
+```
+
+That is the only file you need from SmoothPan. No raw edits, no init file required (optional auto-load below).
+
+### 3. Enable in-game
+
+Launch the game **through DFHack**, open the DFHack console (`ctrl` + `shift` + `d` in-game if needed), then:
+
+```
+plugin load smoothpan
+enable smoothpan
+```
+
+You should see:
+
+```
+SmoothPan 3.11.46 enabled
+```
+
+Enter a fortress and pan with **WASD** (or arrow keys).
+
+### Optional — auto-load every session
+
+Add to `dfhack-config\init\dfhack.init` (create the file if missing):
+
+```
+plugin load smoothpan
+enable smoothpan
+```
+
+### Updating or removing
+
+```
+plugin unload smoothpan
+```
+
+Replace `hack\plugins\smoothpan.plug.dll`, then `plugin load smoothpan` / `enable smoothpan` again.
+
+To uninstall: unload the plugin and delete `smoothpan.plug.dll` from `hack\plugins\`.
+
+More detail: [releases/v1.0.0/INSTALL.txt](releases/v1.0.0/INSTALL.txt)
 
 ---
 
@@ -14,33 +88,14 @@ The game continues to simulate on integer tile coordinates (`window_x` / `window
 |---------|-------------|
 | **Smooth pan** | WASD / arrow keys pan with fractional tile motion at full refresh rate |
 | **Stable HUD** | Toolbar, panels, and overlays stay fixed while the map shifts underneath |
-| **Mouse sync** | World picks, mining designation drag, and UI clicks while panned (GPS + designation-only patch) |
+| **Mouse sync** | World picks, mining designation drag, and UI clicks while panned |
 | **Multi-z alignment** | Lower-z show-through and off-map passes shift with the main map |
 | **Smart performance** | Conditional z-rebake on cliffs only; lazy minimap rebuilds during pan |
 | **Diagnostics** | F7/F9 hotkeys and console commands for perf and telemetry |
 
 ---
 
-## Quick start
-
-### Requirements
-
-- Dwarf Fortress **Premium** (Steam)
-- DFHack built for your DF version (Windows tested)
-- Plugin built as `smoothpan.plug.dll` in `hack/plugins/`
-
-### Enable in-game
-
-```
-plugin load smoothpan
-enable smoothpan
-```
-
-You should see: `SmoothPan 3.11.46 enabled`
-
-No setup ritual required — mouse compensation boots to GPS-only automatically.
-
-### Controls
+## Controls
 
 | Input | Action |
 |-------|--------|
@@ -53,15 +108,13 @@ No setup ritual required — mouse compensation boots to GPS-only automatically.
 
 ---
 
-## Default behavior (3.11.46)
-
-These are the production defaults — tuned for **180 Hz** play with acceptable minimap lag:
+## Default behavior (v1.0.0 / build 3.11.46)
 
 | Subsystem | Default | Notes |
 |-----------|---------|-------|
 | Pan z-rebake | **`smart`** | Full rebake only when lower-z / cliffs visible |
 | Minimap | **`lazy`** | Full rebuild at most every **2 s** while panning; sync on pan stop |
-| Mouse | **`gps`** | Bump `precise_mouse_x/y` in feed/logic; designation drag also patches `mouse_x/y` briefly |
+| Mouse | **`gps`** | Automatic; no F8 ritual required |
 
 Console tuning:
 
@@ -77,33 +130,25 @@ Logs: `{DF folder}/dfhack-config/smoothpan/`
 
 ---
 
-## Build
+## Building from source
 
-The plugin is a standard DFHack plugin (C++, MinHook, SDL2 headers). Source layout matches `dfhack/plugins/smoothpan/` in a full DFHack tree.
+Only needed if you are developing SmoothPan or your DF/DFHack version has no pre-built release yet.
 
-### Windows (Visual Studio + existing DFHack build)
+Requirements: a full [DFHack](https://github.com/DFHack/dfhack) source tree, Visual Studio 2022, CMake.
 
-From the plugin directory inside your DFHack checkout:
+Copy or symlink this repo’s `src/` into `dfhack/plugins/smoothpan/` (or use the canonical layout in `src/CMakeLists.txt`), then:
 
 ```powershell
-# Build target (adjust path to your DFHack build dir)
-cmake --build "D:\dfhack\build\VC2022" --target smoothpan --config Release
+cmake --build "{DFHack build dir}" --target smoothpan --config Release
+```
 
-# Optional: deploy.ps1 copies DLL to Steam DF and verifies version string
+Output: `plugins/smoothpan/Release/smoothpan.plug.dll` → copy to `{DF}/hack/plugins/`.
+
+Or use `deploy.ps1` (edit `$DfPath` if your Steam install is elsewhere):
+
+```powershell
 powershell -ExecutionPolicy Bypass -File deploy.ps1
 ```
-
-Output: `build/.../plugins/smoothpan/Release/smoothpan.plug.dll` → copy to `{DF}/hack/plugins/`.
-
-After replacing the DLL:
-
-```
-plugin unload smoothpan
-plugin load smoothpan
-enable smoothpan
-```
-
-Keep **`version.h`** and **`deploy.ps1`** `$version` in sync on each release.
 
 ---
 
@@ -111,44 +156,23 @@ Keep **`version.h`** and **`deploy.ps1`** `$version` in sync on each release.
 
 | Document | Contents |
 |----------|----------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **How it works** — hooks, coordinates, render pipeline, subsystems |
-| [docs/STATUS_3.11.md](docs/STATUS_3.11.md) | **Project status** — what's done, version history, file map |
-| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | **Performance** — FFD policy, minimap throttling, perf captures |
-| [docs/MOUSE_SYNC.md](docs/MOUSE_SYNC.md) | Mouse compensation — production model and regression checklist |
-| [docs/GOLDEN_PATH.md](docs/GOLDEN_PATH.md) | Target behavior and anti-patterns (do not reintroduce) |
-| [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | F7 perf profiler, F9 telemetry, console commands |
-| [docs/PIPELINE.md](docs/PIPELINE.md) | Premium DF render pipeline research notes |
-| [docs/PLAN_3.11.md](docs/PLAN_3.11.md) | 3.11.0 diagnosis and fix plan (historical) |
-
----
-
-## Architecture (summary)
-
-```
-WASD → feed hook → SmoothCamera.update()
-                      ├─ window_x/y  (integer tiles, on boundary cross)
-                      ├─ frac_x/y    (sub-tile remainder)
-                      ├─ minimap flags + ffd policy
-                      └─ frozen render_shift at render start
-
-render → update_full_viewport (main + lower-z passes)
-       → SDL_RenderCopy* hooks shift map blits by -render_shift
-       → HUD / UI blits unshifted
-
-feed/logic → GPS mouse bump (+render_shift on precise_mouse_x/y)
-           → designation_sync during live rectangle drag (mouse_x/y + selection_rect)
-```
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full diagram, coordinate spaces, and file map.
+| [docs/STATUS_3.11.md](docs/STATUS_3.11.md) | Project status and version history |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it works — hooks, coordinates, pipeline |
+| [docs/MOUSE_SYNC.md](docs/MOUSE_SYNC.md) | Mouse + designation compensation |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | FFD policy, minimap throttling |
+| [docs/GOLDEN_PATH.md](docs/GOLDEN_PATH.md) | Target behavior and anti-patterns |
+| [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | F7/F9 tooling |
+| [releases/README.md](releases/README.md) | Pre-built DLL index |
 
 ---
 
 ## Known limitations
 
-- **Dwarf Fortress mode only** (`viewscreen_dwarfmodest`) — not adventure/legends
-- **Windows** — physical key release uses `GetAsyncKeyState`
-- **Minimap** — intentionally laggy during pan in lazy mode; catches up on pan stop
-- **Cliff / open-air views** — still pay full z-rebake cost while panning (required for visual correctness)
+- **Dwarf Fortress fortress mode only** — not adventure/legends
+- **Windows** — tested on Windows; Linux would need a port (key release uses `GetAsyncKeyState`)
+- **DFHack required** — plugin must match your DF + DFHack version; after a game update, wait for updated DFHack and a new SmoothPan release if the DLL stops loading
+- **Minimap** — may lag during pan in lazy mode; catches up when you stop
+- **Cliff / open-air views** — full z-rebake while panning (required for visual correctness)
 
 ---
 
