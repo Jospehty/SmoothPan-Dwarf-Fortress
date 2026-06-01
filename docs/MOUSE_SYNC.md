@@ -1,6 +1,6 @@
 # SmoothPan — Mouse Sync (Resolved)
 
-**Status: fixed in 3.11.34** (user-verified: world + UI at all zoom levels, no manual F8 ritual)
+**Status: fixed in 3.11.34** (world + UI clicks). **Mining designation drag: fixed in 3.11.46.**
 
 Mouse sync was the last major blocker. Visual panning (edges, HUD, zoom levels) was solid from 3.11.0 onward; input lagged behind because we were fighting the wrong problem.
 
@@ -13,11 +13,28 @@ Mouse sync was the last major blocker. Visual panning (edges, HUD, zoom levels) 
 | Boot mode | **`gps`** (`MouseCompMode::GpsOnly`) |
 | Compensation | Bump **`gps->precise_mouse_x/y`** only during `feed` and `logic` |
 | SDL mouse hook | **Off** in normal play (`mouse_comp_sdl_enabled()` false) |
-| Fields never touched | `mouse_x`, `mouse_y`, `window_x`, `window_y` |
+| Fields never touched globally | `mouse_x`, `mouse_y`, `window_x`, `window_y` |
 
 On `enable smoothpan`, the plugin calls `mouse_comp_boot_gps()` and stays in GPS mode. No warmup cycle, no auto `sdl → gps → both` frame dance.
 
-**User test (3.11.34):** Enable → pan → click map and UI at multiple zoom levels — all correct without pressing F8.
+**User test (3.11.46):** Pan → drag-mine designate → click dwarf sprite → switch info tabs — all correct without F8.
+
+---
+
+## Designation drag (3.11.44–3.11.46)
+
+Rectangle mining/stockpile/zone paint uses **`mouse_x/y`** (text-grid index) for commit, not just `precise_mouse`. GPS-only compensation fixed single clicks and preview overlay, but drag-paint designated the wrong tiles.
+
+**Production fix (`designation_sync.cpp`):**
+
+| When | What |
+|------|------|
+| Live rectangle drag (`doing_rectangle` + valid `selection_rect.start`) | Briefly set `mouse_x/y = precise/cell` (compensated) and sync `selection_rect` end from `getMousePos()` |
+| Designate paint mouse-down | Rewrite fresh `selection_rect.start` in `after_vanilla` only (no global `mouse_x` touch) |
+| Render during live drag | Same sync while `map_port` fractional shift is applied |
+| UI / stale drag flag | **No patch** — require live `selection_rect`; block any `IsMouseInUI_reason != 0` |
+
+**Do not** bump `mouse_x/y` globally in `apply_mouse_compensation` (3.11.42 broke UI tabs).
 
 ---
 
@@ -79,6 +96,7 @@ Interpretation:
 |------|------|
 | `mouse_comp.cpp` / `mouse_comp.h` | Mode enum; `mouse_comp_boot_gps()` sets `GpsOnly` |
 | `smoothpan.cpp` | `apply_mouse_compensation` / `restore_mouse_compensation` in `feed`/`logic` |
+| `designation_sync.cpp` | Designation-only `mouse_x/y` + `selection_rect` during live drags |
 | `viewport.cpp` | `map_pick_screen_for_gate`, `mouse_gate_should_compensate` — unified UI gate |
 | `sdl_hook.cpp` | SDL mouse hook (disabled when `mouse=gps`); F9 telemetry `mouse=` field |
 
@@ -118,11 +136,10 @@ Mouse: gps (map + UI). F8 only if debugging mouse layers.
 After any mouse or viewport change, re-run:
 
 1. Enable plugin — no F8
-2. Pan mid sub-tile (`frac ≈ 0.25`, `0.5`, `0.75`) — designate a unique map feature → **0 tile error**
-3. Repeat at **max zoom** and **one step zoomed out**
-4. Click toolbar / side panels — no spurious dismiss
-5. Hover tooltips on map track cursor
-6. F9 once — confirm `mouse=gps`, sensible `shift=` while panned
+2. Pan mid sub-tile — designate a rectangle on map → **matches preview**
+3. Pan — click map sprite and dwarf info tabs — **no spurious close**
+4. Repeat at **max zoom** and **one step zoomed out**
+5. F9 — confirm `mouse=gps`, `desig drag=0` when not dragging
 
 Archive one good F9 capture per release under `dfhack-config/smoothpan/`.
 

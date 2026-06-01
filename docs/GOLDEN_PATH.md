@@ -1,16 +1,21 @@
 # SmoothPan Golden Path
 
-This document defines the **target visual state** for SmoothPan and lists patterns that must not be reintroduced.
+Target visual and input state for SmoothPan. Patterns listed under **Anti-patterns** must not be reintroduced.
 
-## Target state (user-verified baseline)
+See also [MOUSE_SYNC.md](MOUSE_SYNC.md) for the resolved mouse + designation model (3.11.46).
 
-| Working | Known follow-ups (Phase B) |
+## Target state (user-verified baseline — 3.11.46)
+
+| Working | Remaining minor follow-ups |
 |---------|---------------------------|
-| Smooth sub-tile map pan | Tooltip offset vs cursor on map |
-| HUD stable (toolbar, panels) | UI clicks occasionally mis-register while panning |
-| No tile-scale ghosting / judder | |
+| Smooth sub-tile map pan (all edges, zoom levels) | Optional cleanup of debug `both`/SDL toggle |
+| HUD stable (toolbar, panels) | |
+| Mouse: world + UI clicks while panned | |
+| Mining designation drag while panned | |
+| Tooltips, designation preview, cursor box on map | |
+| Minimap outline | Catches up on pan stop; may lag during pan (lazy mode OK) |
 
-Phase A (3.3.0) restores the visual baseline. Phase B fixes mouse/tooltip/UI without changing render shift rules.
+Phase A (visual), Phase B (mouse), and Phase C (designation drag) are **complete** for normal play.
 
 ## Render shift rule
 
@@ -22,71 +27,68 @@ Shift a blit when **all** are true:
 4. NOT Premium info panel
 5. NOT intersecting a **leaf** widget (overlay panels; container bounds ignored to avoid fullscreen-root false positives)
 
-**Do not gate on SDL clip rect.** Premium DF never sets a viewport-matching clip in F9 telemetry (`pass=0` on every blit). Clip logging is kept for pipeline RE only.
+**Do not gate on SDL clip rect.** Premium DF rarely sets a viewport-matching clip in F9 telemetry. Clip logging is kept for pipeline RE only.
 
-Mouse compensation uses **`IsMouseInUI`** (viewport bounds + widget hit-test), not `classify_blit` — toolbar buttons are not map blits but must not receive shifted coordinates.
+Mouse compensation uses the **unified UI gate** in `viewport.cpp` (`map_pick_screen_for_gate`, `mouse_gate_should_compensate`), not raw SDL coords alone.
 
 ## Overscan (edge fill)
 
-Black/juddering borders appear when map blits shift without extra tiles drawn at the leading edge. Paired mechanism:
+Black/juddering borders appear when map blits shift without extra tiles drawn at the leading edge. In current SDL mode, overscan window offset is **disabled**; sub-tile motion is SDL blit shift only (`render_shift = render_frac * cell`).
 
-1. **`begin_render_overscan`**: if `render_frac > 0`, temporarily `window_x/y -= 1` so DF draws one extra tile row/column
-2. **`render_shift`**: `render_frac * z - overscan_tiles * z` (compensates for the temporary window pull-back)
-3. **Clip expand**: when overscan is active and clip matches viewport, expand by ±`tile_px` (same as pre-3.3.0 architecture)
-
-Do not use clip expand or edge masks without overscan.
+Do not use clip expand or edge masks without understanding overscan interaction — see [PIPELINE.md](PIPELINE.md) for history.
 
 ## Sub-pixel shift
 
 - `frac_x/y` updated in `SmoothCamera.update()` each logic tick
-- `freeze_render_frac()` once at render start (`begin_render_overscan`) — frozen `render_frac_x/y` for the whole frame
+- `freeze_render_frac()` once at render start (`begin_render_overscan`)
 - Integer blits: subtract `lround(render_shift)`
-- Float blits (`RenderCopyF` / `ExF`): subtract **float** `render_shift` directly (no int truncation of destination)
+- Float blits (`RenderCopyF` / `ExF`): subtract **float** `render_shift` directly
 
-## Mouse compensation (Phase B)
+## Mouse compensation (production — 3.11.46)
 
-- Hook `SDL_GetMouseState` and `SDL_GetGlobalMouseState` only
-- Compensate when **not** `IsMouseInUI` (viewport bounds, widget tree, Premium info panel)
-- Use the same frozen `render_shift` as render hooks
-- Do **not** use widget-tree filtering for render classification (false positives / Z-order fights)
+- **Boot to GPS-only** (`mouse_comp_boot_gps()` on enable)
+- Bump **`gps->precise_mouse_x/y`** in `feed` and `logic` only
+- **Do not** bump `mouse_x/y` or `window_x/y` globally
+- **Exception:** `designation_sync.cpp` patches `mouse_x/y` only during **live rectangle drags** over map (saved/restored around vanilla)
+- SDL `GetMouseState` hook is **off** in production (`mouse=gps`)
+- Same frozen `render_shift` as render hooks; skip when UI gate says in-UI
+
+Debug: F8 toggles `gps` ↔ `both`; F9 dumps telemetry. Not required for normal play.
 
 ## Anti-patterns (from historical review + regressions)
 
 | Pattern | Why it fails |
 |---------|----------------|
 | Shift only `tile_sized` blits | Entities on `RenderCopyF` stay on integer grid → judder |
-| Widget-tree render filter **without map-pass gate** | Unit panel 40×40 borders shifted → orange ghosting |
-| Widget-tree render filter **as sole gate** | Map false positives / Z-order fights (Gemini) |
-| Clip rect expand without overscan | Edge ghosting when overscan window is disabled |
-| Overscan **scaling** of dst rects | Distorts sprites; breaks alignment |
-| `tile_aligned` / `fully_inside` gates | Pinned edge tiles; alternating ghost frames |
-| Present-time frac resnapshot | Shift can drift mid-frame vs camera update |
-| Present-time black edge masks with overscan | Double-compensation artifacts |
+| Widget-tree render filter **without map-pass gate** | Unit panel borders shifted → ghosting |
+| Widget-tree render filter **as sole gate** | Map false positives / Z-order fights |
+| Bump `mouse_x/y` globally in `apply_mouse_compensation` | Breaks UI tabs / text grid (3.11.42) |
+| Bump `mouse_x/y` during stale `doing_rectangle` without live `selection_rect` | Closes dwarf info / poisons UI clicks (3.11.45) |
+| Bump `window_x/y` for mouse | Breaks `getMousePos()` paths |
+| SDL hook + GPS bump both on at boot | Double-comp / wrong boot state; use GPS-only |
+| Auto mode warmup cycles | Never matched manual F8 timing; polluted SDL state |
+| Constant `(vp.left - origin)` in mouse comp | Gap not multiple of cell → multi-tile error |
+| Present-time frac resnapshot | Shift drifts mid-frame vs camera update |
 
 ## Pass criteria
 
-**Phase A (visual):**
+**Visual:**
 
 - Pan NE at 60 FPS: smooth, no tile-scale alternating ghosts
 - HUD toolbar/panels: static
-- F9 telemetry: non-UI viewport blits shifted > 99% for both `tile=1` and `tile=0`
+- F9: non-UI viewport blits shifted > 99% for tile and sprite classes
 
-**Phase B (input):**
+**Input (3.11.34+):**
 
-- Map clicks accurate while panning
-- UI buttons click without spurious panel dismiss
-- Tooltips track cursor on map (UI tooltip drift acceptable as follow-up)
+- Enable → pan → map designate: 0 tile error at frac 0, 0.25, 0.5, 0.75
+- UI toolbar clicks: correct, no spurious dismiss
+- Multiple zoom levels: same
+- F9 shows `mouse=gps` when correct
 
 ## Test checklist
 
-After 3.3.0:
-
-1. Console: `SmoothPan 3.3.0 enabled`
+1. Console: `SmoothPan 3.11.41 enabled` (or current version)
 2. Pan NE — smooth? HUD static?
-3. F9 — `sprite=…/… (100%)` and `tile=…/… (100%)`?
-
-After Phase B mouse fixes:
-
-4. Map clicks while panning
-5. UI panel buttons (no spurious dismiss)
-6. Tooltip vs cursor on map
+3. Click map feature mid-pan — correct tile?
+4. Click UI tab / panel — correct hit?
+5. F9 — `mouse=gps`, sensible `shift=` while panned

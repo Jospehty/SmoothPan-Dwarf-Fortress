@@ -91,4 +91,24 @@ While panning: `minimap.update` still runs each tile step (cheap). Full `mustmak
 
 ---
 
+## F9 telemetry (3.11.46+)
+
+**F9** dumps ~30 frames to `{dfhack-config}/smoothpan/smoothpan_telemetry.txt`.
+
+Key per-frame lines:
+
+| Field | Meaning |
+|-------|---------|
+| `SMOOTHPAN_3.11.46` | Build version |
+| `mouse=gps` | Production mouse mode |
+| `comp feed=` / `rend=` | GPS compensation reason codes |
+| `desig active=` `paint=` `drag=` | Designation sync state |
+| `patched_mx,my=` | Temporary `mouse_x/y` during live drag (should be absent when idle) |
+| `sel start=` / `end=` | `selection_rect` world coords |
+| `click#` ring | Recent feed clicks with `inui`, `tile`, `expected` |
+
+When not drag-designating, expect `desig active=0` or `drag=0`. UI tab clicks should show `inui=5` with no designation patch.
+
+---
+
 ## F9 probe cycle (legacy — shift mode A/B)
