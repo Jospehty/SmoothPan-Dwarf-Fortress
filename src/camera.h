@@ -28,6 +28,7 @@ struct SmoothCamera {
         int saved_window_y = 0;
         int applied_ppc_x = -1;
         int applied_ppc_y = -1;
+        float render_zoom_scale = 1.0f;
     };
 
     double true_x = 0;
@@ -87,6 +88,15 @@ struct SmoothCamera {
 };
 
 extern SmoothCamera g_camera;
+
+// Zoom-transition window (Stage 1, build 3.21.0+).
+// Set to a small frame count whenever gps->viewport_zoom_factor changes so the
+// SDL clip code can relax the origin-grid clip across vanilla's non-atomic
+// multi-frame rebake (the NARROW/WIDE alternation that caused black edge bands).
+// Decremented once per SDL_RenderPresent.  g_zoom_prev_z holds the z value we
+// were at before the most recent change (telemetry / future easing direction).
+extern std::atomic<int> g_zoom_transition_frames;
+extern std::atomic<int> g_zoom_prev_z;
 
 extern int g_sp_mmb_held;
 extern int g_sp_middle_drag;

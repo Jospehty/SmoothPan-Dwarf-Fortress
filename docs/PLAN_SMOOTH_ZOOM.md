@@ -1,6 +1,6 @@
 # SmoothPan — Smooth Zoom Plan
 
-**Status:** Phase 2 **parked at 3.13.7** — SDL zoom scale disabled (viewport buffer constraint); see [INVESTIGATION_ZOOM_AND_EDGES.md](INVESTIGATION_ZOOM_AND_EDGES.md)  
+**Status:** **Removed in 3.20.0** — see [ZOOM_POSTMORTEM.md](ZOOM_POSTMORTEM.md). Pan-only until Phase R margin ring is solved.  
 **Ladder (verified):** z = 64, 96, 128, 160, 192, 224, 256 (Δ32)  
 **Input path:** wheel → `feed_ZOOM_IN` / `feed_ZOOM_OUT` (not `renderer::zoom`)  
 **Next:** Trace vanilla rebake allocation → safe margin ring → re-enable visual zoom

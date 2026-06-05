@@ -2,7 +2,7 @@
 
 How SmoothPan implements smooth sub-tile panning in **Dwarf Fortress Premium** (DF 50.x) without modifying the game binary.
 
-**Version documented:** 3.14.1 (stable pan/MMB foundation). Smooth zoom plan: [PLAN_SMOOTH_ZOOM.md](PLAN_SMOOTH_ZOOM.md) (parked — revisit with edge-stretch lessons).
+**Version documented:** 3.15.0 (stable pan/MMB + experimental smooth zoom). Smooth zoom plan: [PLAN_SMOOTH_ZOOM.md](PLAN_SMOOTH_ZOOM.md).
 
 ---
 
@@ -149,7 +149,7 @@ Interposes `df::renderer_2d`:
 
 Shift is applied only when `g_in_main_viewport_update` or controlled post-viewport map compositing is active — **not** for HUD overlays drawn afterward.
 
-**Edge gaps (3.14.1):** Sub-tile pan shifts map blits left/up, leaving an unbaked strip on the right/bottom. The viewport buffer is fixed-size (`dim_x × dim_y`); painting outside it requires vanilla rebake/realloc — not safe to hack. Instead, the last column/row grid tiles extend their **destination width/height in float** to the viewport edge in the **same** `RenderCopyF` as the pan shift (`map_blit_extend_viewport_edges`). One integrated stretch per frame tracks `render_shift` without a second fill pass or extra memory.
+**Edge gaps (3.14.1+):** Sub-tile pan shifts map blits left/up, leaving an unbaked strip on the right/bottom. The viewport buffer is fixed-size (`dim_x × dim_y`); painting outside it requires vanilla rebake/realloc — not safe to hack. Instead, edge grid tiles extend their **destination width/height in float** to the viewport edge in the **same** `RenderCopyF` as the pan shift (`map_blit_extend_viewport_edges`). Pan uses trailing right/bottom; **smooth zoom (3.15.0)** also extends first column/row to `vp.left`/`vp.top` while SDL scale eases toward 1.0. Toggle: `smoothpan zoom off` for vanilla stepped zoom.
 
 All hooks no-op when `is_enabled == false`.
 

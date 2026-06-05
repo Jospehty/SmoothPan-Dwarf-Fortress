@@ -16,7 +16,6 @@
 #include "viewport.h"
 #include "sdl_hook.h"
 #include "zoom_probe.h"
-#include "zoom_camera.h"
 #include <cstdio>
 #include <cstring>
 
@@ -110,9 +109,6 @@ static void sync_minimap_on_pan_end() {
 }
 
 void smoothpan_notify_zoom_commit() {
-    minimap_mark_camera_moved(true, true);
-    if (df::global::gps && df::global::gps->force_full_display_count < 1)
-        df::global::gps->force_full_display_count = 1;
 }
 
 void smoothpan_set_minimap_full_rebuild(bool full) {
@@ -162,6 +158,11 @@ void smoothpan_set_minimap_pan_mode(const char* mode) {
 
 SmoothCamera g_camera;
 
+// Zoom-transition window (Stage 1).  See camera.h.
+std::atomic<int> g_zoom_transition_frames{0};
+std::atomic<int> g_zoom_prev_z{0};
+static constexpr int kZoomTransitionFrames = 8;
+
 void SmoothCamera::reset() {
     first_frame = true;
     panning_up = false;
@@ -176,7 +177,6 @@ void SmoothCamera::reset() {
     overscan_tiles_y = 0;
     overscan_active = false;
     last_zoom = 0;
-    smoothpan_zoom_reset();
     last_vel_sign_x = 0;
     last_vel_sign_y = 0;
     last_snapshot = {};
@@ -353,7 +353,8 @@ void SmoothCamera::freeze_render_frac() {
     render_frac_y = frac_y.load(std::memory_order_relaxed);
     frame_frac_x.store(render_frac_x, std::memory_order_relaxed);
     frame_frac_y.store(render_frac_y, std::memory_order_relaxed);
-    render_zoom_scale = smoothpan_zoom_render_scale();
+    render_zoom_scale = 1.0f;
+    last_snapshot.render_zoom_scale = 1.0f;
 }
 
 // Returns the pixel width of one graphical map tile.
@@ -551,7 +552,6 @@ void SmoothCamera::update() {
         }
         if (df::global::gps) {
             last_zoom = df::global::gps->viewport_zoom_factor;
-            smoothpan_zoom_sync_baked();
         }
         return;
     }
@@ -559,23 +559,23 @@ void SmoothCamera::update() {
     float dt = std::chrono::duration<float>(now - last_frame).count();
     last_frame = now;
     if (dt > 0.1f) dt = 0.1f;
-    smoothpan_zoom_update(dt);
-    
+
     if (!df::global::window_x || !df::global::window_y || !df::global::gps || !df::global::world) return;
 
-    int zoom = df::global::gps->viewport_zoom_factor;
-    if (zoom != last_zoom) {
-        if (last_zoom != 0)
-            zoom_probe_note_gps_z_change(last_zoom, zoom);
-        else
-            zoom_probe_note_gps_z_change(0, zoom);
-        if (smoothpan_zoom_take_committed_flag()) {
-            smoothpan_zoom_on_our_commit(last_zoom, zoom);
-        } else {
-            smoothpan_zoom_on_external_change(last_zoom, zoom);
+    if (df::global::gps) {
+        int zoom = df::global::gps->viewport_zoom_factor;
+        if (zoom != last_zoom) {
+            if (last_zoom != 0) {
+                zoom_probe_note_gps_z_change(last_zoom, zoom);
+                // Open the transition window so the SDL clip relaxes across
+                // vanilla's multi-frame rebake (fixes black edge bands).
+                g_zoom_prev_z.store(last_zoom, std::memory_order_relaxed);
+                g_zoom_transition_frames.store(kZoomTransitionFrames,
+                                               std::memory_order_relaxed);
+            }
+            last_zoom = zoom;
         }
     }
-    last_zoom = zoom;
     
     if (!is_physical_up_held()) panning_up = false;
     if (!is_physical_down_held()) panning_down = false;

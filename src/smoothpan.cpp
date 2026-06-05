@@ -34,7 +34,6 @@
 #include "ffd_policy.h"
 #include "designation_sync.h"
 #include "zoom_probe.h"
-#include "zoom_camera.h"
 #include <SDL.h>
 #include <cstdio>
 
@@ -152,8 +151,16 @@ static void apply_mouse_compensation(char src) {
     if (src == 'f') g_sp_comp_feed_calls++;
     else g_sp_comp_rend_calls++;
 
-    // Render normally skips GPS comp; allow it only during designation rectangle drag.
-    if (src == 'r' && !designation_sync_wants_render()) { *reason = 8; return; }
+    // Render normally skips GPS comp; allow it only during designation rectangle drag
+    // or any placement mode (BUILDING_PLACEMENT / ZONE_PAINT / STOCKPILE_PAINT /
+    // BURROW_PAINT / main_designation_selected != NONE) when cursor is over the map.
+    if (src == 'r') {
+        int uncomp_px = (df::global::gps && df::global::gps->precise_mouse_x >= 0)
+            ? df::global::gps->precise_mouse_x : -1;
+        int uncomp_py = (df::global::gps && df::global::gps->precise_mouse_y >= 0)
+            ? df::global::gps->precise_mouse_y : -1;
+        if (!designation_sync_wants_render(uncomp_px, uncomp_py)) { *reason = 8; return; }
+    }
 
     if (g_mouse_comp_applied) { *reason = 7; return; }
     if (!mouse_comp_gps_enabled()) { *reason = 9; return; }
@@ -266,12 +273,6 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             }
             mmb_map_grab = smoothpan_middle_mouse_map_gate(gate_px, gate_py);
         }
-
-        if (input->count(df::interface_key::ZOOM_IN))
-            zoom_probe_note_feed_zoom_in();
-        if (input->count(df::interface_key::ZOOM_OUT))
-            zoom_probe_note_feed_zoom_out();
-        // Wheel zoom: vanilla only (Phase 1 intercept disabled — unsafe from logic hook).
 
         if (mmb_held && (g_camera.middle_drag_active || map_scrolling || mmb_map_grab)) {
             input->erase(df::interface_key::CURSOR_UP);
@@ -442,8 +443,20 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             apply_map_port_shift();
         }
 
-        bool comp_rend = is_enabled && !trace_is_active() && designation_sync_wants_render();
+        bool comp_rend = false;
         int uncomp_x = -1, uncomp_y = -1;
+        uncompensated_precise(&uncomp_x, &uncomp_y);
+        comp_rend = is_enabled && !trace_is_active() && designation_sync_wants_render(uncomp_x, uncomp_y);
+        // Capture cursor at start-of-render (before comp).  DF resets
+        // df::global::cursor to (-30000) at end of frame, so we must
+        // snapshot it here to know where the ghost is anchored.
+        if (df::global::cursor && df::global::gps) {
+            g_sp_cur_rend_start_x = df::global::cursor->x;
+            g_sp_cur_rend_start_y = df::global::cursor->y;
+            g_sp_cur_rend_start_z = df::global::cursor->z;
+            g_sp_cur_precise_rend_start_x = df::global::gps->precise_mouse_x;
+            g_sp_cur_precise_rend_start_y = df::global::gps->precise_mouse_y;
+        }
         if (comp_rend) {
             apply_mouse_compensation('r');
             uncompensated_precise(&uncomp_x, &uncomp_y);
@@ -452,6 +465,14 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
 
         INTERPOSE_NEXT(render)(unk);
 
+        // Capture cursor at end-of-render (after comp, before restore).
+        if (df::global::cursor && df::global::gps) {
+            g_sp_cur_rend_end_x = df::global::cursor->x;
+            g_sp_cur_rend_end_y = df::global::cursor->y;
+            g_sp_cur_rend_end_z = df::global::cursor->z;
+            g_sp_cur_precise_rend_end_x = df::global::gps->precise_mouse_x;
+            g_sp_cur_precise_rend_end_y = df::global::gps->precise_mouse_y;
+        }
         if (comp_rend) {
             uncompensated_precise(&uncomp_x, &uncomp_y);
             designation_sync_after_vanilla(uncomp_x, uncomp_y);
@@ -497,11 +518,7 @@ static void smoothpan_poll_debug_hotkeys() {
     }
 
     if (f9 && !f9_was_down) {
-        g_test_dump_frames = 30;
-        g_classify_log_frames = 0;
-        g_test_dump_delay = 0;
-        std::string log_path = smoothpan_log_path("smoothpan_telemetry.txt");
-        remove(log_path.c_str());
+        smoothpan_arm_capture(30, 0);
     }
     if (f10 && !f10_was_down) {
         g_classify_log_frames = 60;
@@ -537,12 +554,21 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         int frames = std::stoi(parameters[1]);
         int delay = (parameters.size() == 3) ? std::stoi(parameters[2]) : 150;
 
-        g_test_dump_frames = frames;
-        g_test_dump_delay = delay;
+        smoothpan_arm_capture(frames, delay);
 
-        std::string log_path = smoothpan_log_path("smoothpan_telemetry.txt");
-        remove(log_path.c_str());
-        out.print("Dumping {} frames after a {} frame delay to {}\n", frames, delay, log_path);
+        // Build the actual file name we just armed (matches telemetry_file_name()
+        // in sdl_hook.cpp so the message agrees with what the file will be).
+        std::string fname;
+        if (g_capture_label.empty()) {
+            fname = "smoothpan_telemetry.txt";
+        } else {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "smoothpan_telemetry_%s_%d.txt",
+                          g_capture_label.c_str(), g_capture_seq);
+            fname = buf;
+        }
+        out.print("Dumping {} frames after a {} frame delay to {}\n",
+                  frames, delay, smoothpan_log_path(fname.c_str()));
     } else if (parameters.size() >= 2 && parameters[0] == "classify") {
         int frames = std::stoi(parameters[1]);
         int delay = (parameters.size() == 3) ? std::stoi(parameters[2]) : 0;
@@ -616,6 +642,61 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
             out.print("  smoothpan minimap interval <ms> — set lazy/outline throttle (80-60000)\n");
             return CR_FAILURE;
         }
+    } else if (parameters.size() >= 2 && parameters[0] == "zoom") {
+        out.print("Smooth wheel zoom was removed in 3.20.0 (pan-only). Wheel uses vanilla DF.\n");
+        out.print("See docs/ZOOM_POSTMORTEM.md for history.\n");
+    } else if (parameters.size() >= 2 && parameters[0] == "clip") {
+        if (parameters[1] == "legacy" || parameters[1] == "old") {
+            smoothpan_set_legacy_clip(true);
+            out.print("Map clip: LEGACY (constrain every frame = 3.20.0 black-band behavior).\n");
+            out.print("Use F9 during vanilla zoom to capture the starved baseline, then 'smoothpan clip gated'.\n");
+        } else if (parameters[1] == "gated" || parameters[1] == "new") {
+            smoothpan_set_legacy_clip(false);
+            out.print("Map clip: GATED (3.21.0 fix — relax clip at rest / during zoom transition).\n");
+        } else {
+            out.print("Map clip mode: {} . Use: legacy | gated\n",
+                      smoothpan_legacy_clip() ? "legacy" : "gated");
+        }
+    } else if (parameters[0] == "zoomcap") {
+        // Per-capture labelling + opt-in blit logging.  When a label is set,
+        // every F9 / dump writes a fresh, uniquely-numbered file and never
+        // overwrites a prior capture.  Stage 0 / STEP 0 of SMOOTH_ZOOM_MASTER_PLAN.md.
+        bool show_status = true;
+        for (size_t i = 1; i < parameters.size(); ++i) {
+            const std::string& a = parameters[i];
+            if (a == "blit") {
+                if (i + 1 < parameters.size()) {
+                    const std::string& v = parameters[++i];
+                    if (v == "on" || v == "1") {
+                        smoothpan_set_blit_logging(true);
+                        out.print("Per-blit telemetry: ON (large files — only when debugging).\n");
+                    } else if (v == "off" || v == "0") {
+                        smoothpan_set_blit_logging(false);
+                        out.print("Per-blit telemetry: OFF (default — ClipStarve suffices for the clip test).\n");
+                    } else {
+                        out.print("Unknown blit mode '{}'. Use: on | off\n", v);
+                        return CR_FAILURE;
+                    }
+                    show_status = false;
+                }
+            } else {
+                // Treat the first non-keyword arg as a label.
+                smoothpan_set_capture_label(a.c_str());
+                out.print("Capture label set to '{}'.  Next F9 -> smoothpan_telemetry_{}_{}.txt (auto-incremented).\n",
+                          a, a, g_capture_seq + 1);
+                show_status = false;
+            }
+        }
+        if (show_status) {
+            out.print("Capture label: '{}'  next seq: {}  blit log: {}\n",
+                      smoothpan_capture_label(),
+                      g_capture_seq + 1,
+                      smoothpan_blit_logging() ? "on" : "off");
+            if (g_capture_label.empty()) {
+                out.print("  WARNING: no label set — captures overwrite 'smoothpan_telemetry.txt' (legacy).\n");
+                out.print("  Use 'smoothpan zoomcap <label>' (e.g. 'baseline', 'gated_in') before each capture.\n");
+            }
+        }
     } else if (parameters.size() >= 2 && parameters[0] == "ffd") {
         if (strcmp(parameters[1].c_str(), "always") == 0 ||
             strcmp(parameters[1].c_str(), "smart") == 0 ||
@@ -657,6 +738,8 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         out.print("  smoothpan minimap <lazy|outline|full|fast> — minimap cost on pan\n");
         out.print("  smoothpan minimap interval <ms>           — lazy/outline throttle\n");
         out.print("  smoothpan ffd <always|smart|off>       — pan z-rebake policy\n");
+        out.print("  smoothpan clip <legacy|gated>          — zoom black-band A/B (gated=fix)\n");
+        out.print("  smoothpan zoomcap [<label>] [blit on|off]  — per-capture label + blit log\n");
         out.print("Hotkeys: F7/F12=perf, F8=mouse, F9=dump, F10=classify, F11=probe\n");
         out.print("Shift mode: {}\n", shift_mode_name(g_shift_mode));
         out.print("Pan ffd policy: {}\n", ffd_policy_mode_name(ffd_policy_get_mode()));
@@ -667,6 +750,13 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
                   mouse_comp_effective_name(),
                   mouse_comp_sdl_enabled() ? "on" : "off",
                   mouse_comp_gps_enabled() ? "on" : "off");
+        out.print("Zoom: vanilla (smooth wheel zoom removed in 3.20.0)\n");
+        out.print("Map clip: {} (gated=3.21.0 fix for vanilla-zoom black bands)\n",
+                  smoothpan_legacy_clip() ? "legacy" : "gated");
+        out.print("Capture label: '{}'  next seq: {}  blit log: {}\n",
+                  smoothpan_capture_label(),
+                  g_capture_seq + 1,
+                  smoothpan_blit_logging() ? "on" : "off");
     }
     return CR_OK;
 }
@@ -684,7 +774,6 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
             is_enabled = true;
             g_camera.reset();
             zoom_probe_reset();
-            smoothpan_zoom_reset();
             g_shift_mode = ShiftMode::Sdl;
             InitSDLHooks();
             renderer_hook_install();

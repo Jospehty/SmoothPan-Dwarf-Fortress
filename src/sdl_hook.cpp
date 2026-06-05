@@ -5,7 +5,6 @@
 #include "debug_paths.h"
 #include "version.h"
 #include "zoom_probe.h"
-#include "zoom_camera.h"
 #include "probe.h"
 #include "trace.h"
 #include "shift_mode.h"
@@ -13,6 +12,7 @@
 #include "frame_seq.h"
 #include "renderer_hook.h"
 #include "perf.h"
+#include "designation_sync.h"
 #include "VTableInterpose.h"
 #include "MinHook.h"
 #include <SDL.h>
@@ -23,6 +23,8 @@
 #include "df/global_objects.h"
 #include "df/graphic.h"
 #include "df/graphic_map_portst.h"
+#include "df/gamest.h"
+#include "df/main_interface.h"
 #include "df/enabler.h"
 #include "df/renderer_2d.h"
 #include "df/zoom_commands.h"
@@ -126,8 +128,6 @@ static const int SP_CLICK_RING = 6;
 extern SpClickRec g_click_ring[SP_CLICK_RING];
 extern int g_click_ring_pos;
 
-static bool sdl_shift_mode_active();
-
 static std::atomic<bool> g_in_map_pass{false};
 static int g_clip_log_remaining = 0;
 
@@ -142,26 +142,90 @@ static int g_frame_sprite_shifted = 0;
 static int g_frame_pass_shifted = 0;
 static int g_frame_ui_leak_shifted = 0;
 
+// --- Stage 1 (3.21.0): clip gating + starvation telemetry --------------------
+// The active SDL clip rect (whatever we last handed to True_SDL_RenderSetClipRect)
+// and whether a clip is currently set.  Updated at every clip call site via
+// track_clip() so the blit hooks can measure how many map blits the clip would
+// discard ("starvation") on vanilla's NARROW zoom-rebake frames.
+static SDL_Rect g_active_clip_rect = { 0, 0, 0, 0 };
+static bool g_active_clip_set = false;
+static int g_frame_map_clip_out = 0;
+// A/B toggle (see sdl_hook.h).  false = gated fix; true = 3.20.0 always-clip.
+bool g_force_legacy_clip = false;
+
+void smoothpan_set_legacy_clip(bool legacy) { g_force_legacy_clip = legacy; }
+bool smoothpan_legacy_clip() { return g_force_legacy_clip; }
+
+// --- Stage 2 (3.22.0) capture hygiene: per-capture file naming + blit log gate
+// See sdl_hook.h.  Default label is empty (legacy single-file behavior) and
+// default blit logging is OFF (huge per-blit lines; ClipStarve suffices).
+std::string g_capture_label;
+int g_capture_seq = 0;
+bool g_blit_log_enabled = false;
+void smoothpan_set_capture_label(const char* label) {
+    g_capture_label = label ? label : "";
+}
+void smoothpan_set_blit_logging(bool enabled) { g_blit_log_enabled = enabled; }
+bool smoothpan_blit_logging() { return g_blit_log_enabled; }
+const char* smoothpan_capture_label() { return g_capture_label.c_str(); }
+
+static void track_clip(const SDL_Rect* rect) {
+    if (rect) { g_active_clip_rect = *rect; g_active_clip_set = true; }
+    else { g_active_clip_set = false; }
+}
+
+// True only when the origin-grid clip is genuinely needed: we are actually
+// panning (sub-tile shift ≥ 0.5 px on some axis) AND not inside the zoom
+// transition window.  At rest (shift≈0) and across vanilla's multi-frame zoom
+// rebake the clip is RELAXED so it cannot starve map blits (Problem A / black
+// edge bands).  During real panning with no zoom this is unchanged from before.
+static bool map_clip_should_constrain() {
+    if (g_force_legacy_clip) return true;  // 3.20.0 behavior for A/B capture
+    if (g_zoom_transition_frames.load(std::memory_order_relaxed) > 0) return false;
+    float sx = std::fabs(g_camera.render_shift_x());
+    float sy = std::fabs(g_camera.render_shift_y());
+    return sx >= 0.5f || sy >= 0.5f;
+}
+
+// Count a map-class blit whose destination is fully outside the active clip
+// (i.e. the clip would discard every pixel of it — direct evidence of starvation).
+static void note_clip_starve(int x, int y, int w, int h, const BlitClassification& c) {
+    if (c.cls != BlitClass::Map || c.in_ui) return;
+    if (!g_active_clip_set) return;
+    const SDL_Rect& cl = g_active_clip_rect;
+    const bool fully_outside =
+        x >= cl.x + cl.w || x + w <= cl.x ||
+        y >= cl.y + cl.h || y + h <= cl.y;
+    if (fully_outside) g_frame_map_clip_out++;
+}
+
 void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
     if (!True_SDL_RenderSetClipRect || !sdl_renderer) return;
     SDL_Renderer* r = reinterpret_cast<SDL_Renderer*>(sdl_renderer);
+    static bool s_clip_applied = false;
     if (!enable) {
-        True_SDL_RenderSetClipRect(r, nullptr);
+        // Only restore (null) the clip if WE imposed it.  When we did not
+        // constrain (at rest / during a zoom transition) we leave DF's own clip
+        // state untouched — exactly like vanilla — so map blits are not starved.
+        if (s_clip_applied) {
+            True_SDL_RenderSetClipRect(r, nullptr);
+            track_clip(nullptr);
+            s_clip_applied = false;
+        }
         return;
     }
     if (!sdl_shift_mode_active()) return;
+    if (!map_clip_should_constrain()) return;  // relaxed: no origin clip
     ViewportRect vp;
     if (!get_strict_viewport_rect(&vp)) return;
-    if (smoothpan_zoom_animating()) {
-        True_SDL_RenderSetClipRect(r, nullptr);
-        return;
-    }
     // Pin the left/top of the clip to the bake-grid origin (where col/row 0 is
     // actually drawn), NOT to vp.left/top (screen_x/y, a different coordinate
     // space that fluctuates frame-to-frame).  Width/height span the full map.
     SDL_Rect clip = { vp.origin_x, vp.origin_y,
                       vp.right - vp.left, vp.bottom - vp.top };
     True_SDL_RenderSetClipRect(r, &clip);
+    track_clip(&clip);
+    s_clip_applied = true;
 }
 
 static void apply_mouse_shift(int& mx, int& my) {
@@ -269,6 +333,7 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
                     g_telemetry_log += buf;
                     g_clip_log_remaining--;
                 }
+                track_clip(&expanded);
                 return True_SDL_RenderSetClipRect(renderer, &expanded);
             }
             // Overscan off: mark the pass but leave clip rect untouched.
@@ -289,14 +354,12 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
         // on-screen left/top margin.  The primary clip is set proactively by
         // smoothpan_apply_map_clip() from the renderer hook (DF often sets no
         // clip at all during the pass).
-        if (g_in_main_viewport_update.load(std::memory_order_relaxed) && sdl_shift_mode_active()) {
-            if (smoothpan_zoom_animating()) {
-                if (g_clip_log_remaining > 0 && g_test_dump_delay == 0) {
-                    g_telemetry_log += "Clip: zoom_anim -> (null)\n";
-                    g_clip_log_remaining--;
-                }
-                return True_SDL_RenderSetClipRect(renderer, nullptr);
-            }
+        // Stage 1 (3.21.0): only force the origin snap when we are genuinely
+        // panning and outside a zoom transition.  Otherwise DF's clip passes
+        // through unchanged so vanilla's NARROW zoom-rebake frames are not
+        // starved into black bands.
+        if (g_in_main_viewport_update.load(std::memory_order_relaxed) &&
+            sdl_shift_mode_active() && map_clip_should_constrain()) {
             ViewportRect vp;
             if (get_strict_viewport_rect(&vp)) {
                 SDL_Rect snapped = { vp.origin_x, vp.origin_y,
@@ -304,14 +367,14 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
                 if (g_clip_log_remaining > 0 && g_test_dump_delay == 0) {
                     char buf[256];
                     snprintf(buf, sizeof(buf),
-                             "Clip: in=(%d,%d,%d,%d) -> origin=(%d,%d,%d,%d) zoom=%d\n",
+                             "Clip: in=(%d,%d,%d,%d) -> origin=(%d,%d,%d,%d)\n",
                              rect ? rect->x : -1, rect ? rect->y : -1,
                              rect ? rect->w : -1, rect ? rect->h : -1,
-                             snapped.x, snapped.y, snapped.w, snapped.h,
-                             smoothpan_zoom_animating() ? 1 : 0);
+                             snapped.x, snapped.y, snapped.w, snapped.h);
                     g_telemetry_log += buf;
                     g_clip_log_remaining--;
                 }
+                track_clip(&snapped);
                 return True_SDL_RenderSetClipRect(renderer, &snapped);
             }
         }
@@ -328,13 +391,14 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
             g_clip_log_remaining--;
         }
     }
+    track_clip(rect);
     return True_SDL_RenderSetClipRect(renderer, rect);
 }
 
 // Forward declaration — extend last grid tile to viewport edge (see below).
 static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shifted);
 
-static void map_blit_apply_pan_and_zoom(SDL_FRect* rect, SDL_FPoint* center_opt) {
+static void map_blit_apply_pan_shift(SDL_FRect* rect, SDL_FPoint* center_opt) {
     const float fsx = g_camera.render_shift_x();
     const float fsy = g_camera.render_shift_y();
     rect->x -= fsx;
@@ -342,20 +406,6 @@ static void map_blit_apply_pan_and_zoom(SDL_FRect* rect, SDL_FPoint* center_opt)
     if (center_opt) {
         center_opt->x -= fsx;
         center_opt->y -= fsy;
-    }
-    const float scale = g_camera.render_zoom_scale;
-    if (std::abs(scale - 1.0f) <= 0.0001f) return;
-    ViewportRect vp;
-    if (!get_strict_viewport_rect(&vp)) return;
-    const float ax = (static_cast<float>(vp.left) + static_cast<float>(vp.right)) * 0.5f;
-    const float ay = (static_cast<float>(vp.top) + static_cast<float>(vp.bottom)) * 0.5f;
-    rect->x = ax + (rect->x - ax) * scale;
-    rect->y = ay + (rect->y - ay) * scale;
-    rect->w *= scale;
-    rect->h *= scale;
-    if (center_opt) {
-        center_opt->x = ax + (center_opt->x - ax) * scale;
-        center_opt->y = ay + (center_opt->y - ay) * scale;
     }
 }
 
@@ -404,12 +454,16 @@ static void record_blit_counters(const BlitClassification& c, bool shifted) {
     }
 }
 
-static void log_blit_telemetry(const BlitClassification& c, int x, int y, int w, int h, bool shifted) {
-    if (g_test_dump_frames > 0 && g_test_dump_delay == 0) {
-        char buf[384];
+static void log_blit_telemetry(const BlitClassification& c, int src_x, int src_y, int src_w, int src_h, int x, int y, int w, int h, bool shifted) {
+    if (g_blit_log_enabled && g_test_dump_frames > 0 && g_test_dump_delay == 0) {
+        char buf[512];
         snprintf(buf, sizeof(buf),
-                 "Blit: dst=(%d,%d,%d,%d) pass=%d vpass=%d vmap=%d vpscr=(%d,%d) shifted=%d in_ui=%d tile=%d align=%d suspect=%d\n",
+                 "Blit: frame=%d dst=(%d,%d,%d,%d) src=(%d,%d,%d,%d) vpDim=(%d,%d) pass=%d vpass=%d vmap=%d vpscr=(%d,%d) shifted=%d in_ui=%d tile=%d align=%d suspect=%d\n",
+                 frame_seq_frame_index(),
                  x, y, w, h,
+                 src_x, src_y, src_w, src_h,
+                 g_cur_pass_dim_x.load(std::memory_order_relaxed),
+                 g_cur_pass_dim_y.load(std::memory_order_relaxed),
                  g_in_map_pass.load(std::memory_order_relaxed) ? 1 : 0,
                  g_viewport_pass_index.load(std::memory_order_relaxed),
                  g_cur_pass_is_map.load(std::memory_order_relaxed) ? 1 : 0,
@@ -430,12 +484,16 @@ static void log_blit_telemetry(const BlitClassification& c, int x, int y, int w,
     }
 }
 
-static void log_blit_telemetry_f(const BlitClassification& c, float x, float y, float w, float h, bool shifted) {
-    if (g_test_dump_frames > 0 && g_test_dump_delay == 0) {
-        char buf[384];
+static void log_blit_telemetry_f(const BlitClassification& c, float src_x, float src_y, float src_w, float src_h, float x, float y, float w, float h, bool shifted) {
+    if (g_blit_log_enabled && g_test_dump_frames > 0 && g_test_dump_delay == 0) {
+        char buf[512];
         snprintf(buf, sizeof(buf),
-                 "BlitF: dst=(%.2f,%.2f,%.2f,%.2f) pass=%d shifted=%d in_ui=%d tile=%d\n",
+                 "BlitF: frame=%d dst=(%.2f,%.2f,%.2f,%.2f) src=(%.2f,%.2f,%.2f,%.2f) vpDim=(%d,%d) pass=%d shifted=%d in_ui=%d tile=%d\n",
+                 frame_seq_frame_index(),
                  x, y, w, h,
+                 src_x, src_y, src_w, src_h,
+                 g_cur_pass_dim_x.load(std::memory_order_relaxed),
+                 g_cur_pass_dim_y.load(std::memory_order_relaxed),
                  g_in_map_pass.load(std::memory_order_relaxed) ? 1 : 0,
                  shifted ? 1 : 0,
                  c.in_ui, c.tile_sized);
@@ -443,14 +501,60 @@ static void log_blit_telemetry_f(const BlitClassification& c, float x, float y, 
     }
 }
 
+// Build the per-capture telemetry file path.  Each F9 pair (arm + dump)
+// yields a distinct file so back-to-back F9s never overwrite.  Format:
+//   with label:    smoothpan_telemetry_<label>_<seq>.txt
+//   without label: smoothpan_telemetry_<seq>.txt  (3.23.4: was .txt, no seq)
+static std::string telemetry_file_name() {
+    char buf[128];
+    if (!g_capture_label.empty()) {
+        snprintf(buf, sizeof(buf), "smoothpan_telemetry_%s_%d.txt",
+                 g_capture_label.c_str(), g_capture_seq);
+    } else {
+        snprintf(buf, sizeof(buf), "smoothpan_telemetry_%d.txt",
+                 g_capture_seq);
+    }
+    return buf;
+}
+
 static std::string active_log_path() {
     if (g_test_dump_frames > 0 || g_test_dump_delay > 0) {
-        return smoothpan_log_path("smoothpan_telemetry.txt");
+        return smoothpan_log_path(telemetry_file_name().c_str());
     }
     return smoothpan_log_path("smoothpan_classify.txt");
 }
 
-static bool sdl_shift_mode_active() {
+// Build the per-capture BMP prefix (e.g. "smoothpan_frame_c3_") so frame BMPs
+// never collide between successive captures.  The frame counter (which counts
+// DOWN from N) is appended to this prefix by the present hook.  3.23.4:
+// always include the seq so back-to-back F9s without a label don't collide.
+static std::string telemetry_bmp_prefix() {
+    char buf[64];
+    if (!g_capture_label.empty()) {
+        snprintf(buf, sizeof(buf), "smoothpan_frame_%s_c%d_",
+                 g_capture_label.c_str(), g_capture_seq);
+    } else {
+        snprintf(buf, sizeof(buf), "smoothpan_frame_c%d_", g_capture_seq);
+    }
+    return buf;
+}
+
+// Arm a fresh telemetry capture: bump the per-label sequence (so the new file
+// has a unique name), reset frame counters, and remove any leftover file from
+// a previous (same-label) capture so we start from a clean slate.  Safe to
+// call repeatedly with the same label — each call yields a new file.
+void smoothpan_arm_capture(int frames, int delay) {
+    // 3.23.4: always bump seq, even when label is empty, so back-to-back
+    // F9s without a label still get distinct files.
+    g_capture_seq++;
+    g_test_dump_frames = frames;
+    g_test_dump_delay = delay;
+    g_classify_log_frames = 0;
+    std::string log_path = smoothpan_log_path(telemetry_file_name().c_str());
+    remove(log_path.c_str());
+}
+
+bool sdl_shift_mode_active() {
     return g_shift_mode == ShiftMode::Sdl || g_shift_mode == ShiftMode::SeqPreToolbar;
 }
 
@@ -465,7 +569,7 @@ static bool map_shift_gate_active() {
            g_in_post_viewport_map_shift.load(std::memory_order_relaxed);
 }
 
-static bool process_map_blit(int x, int y, int w, int h, int* out_x, int* out_y) {
+static bool process_map_blit(int src_x, int src_y, int src_w, int src_h, int x, int y, int w, int h, int* out_x, int* out_y) {
     LARGE_INTEGER q0, q1, q_cls, freq;
     const bool time_it = perf_is_active();
     if (time_it) {
@@ -496,7 +600,9 @@ static bool process_map_blit(int x, int y, int w, int h, int* out_x, int* out_y)
 
     bool shifted = should_shift_blit(c);
     record_blit_counters(c, shifted);
-    log_blit_telemetry(c, x, y, w, h, shifted);
+    log_blit_telemetry(c, src_x, src_y, src_w, src_h, x, y, w, h, shifted);
+    if (g_test_dump_frames > 0 || g_classify_log_frames > 0)
+        note_clip_starve(x, y, w, h, c);
 
     if (!shifted) {
         finish(false, classify_us);
@@ -509,7 +615,7 @@ static bool process_map_blit(int x, int y, int w, int h, int* out_x, int* out_y)
     return true;
 }
 
-static bool process_map_blit_f(float x, float y, float w, float h) {
+static bool process_map_blit_f(float src_x, float src_y, float src_w, float src_h, float x, float y, float w, float h) {
     LARGE_INTEGER q0, q1, q_cls, freq;
     const bool time_it = perf_is_active();
     if (time_it) {
@@ -543,7 +649,9 @@ static bool process_map_blit_f(float x, float y, float w, float h) {
     }
     bool shifted = should_shift_blit(c);
     record_blit_counters(c, shifted);
-    log_blit_telemetry_f(c, x, y, w, h, shifted);
+    log_blit_telemetry_f(c, src_x, src_y, src_w, src_h, x, y, w, h, shifted);
+    if (g_test_dump_frames > 0 || g_classify_log_frames > 0)
+        note_clip_starve(ix, iy, iw, ih, c);
     if (g_probe_frames > 0) probe_accumulate_blit(c, shifted);
     finish(shifted, classify_us);
     return shifted;
@@ -588,15 +696,25 @@ static void edge_profile_log(SDL_Renderer* renderer) {
                     vp.bottom - vp.cell_size / 2 };
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "EdgeProfile: vp.left=%d vp.right=%d origin_x=%d shift_x=%.2f\n",
-             vp.left, vp.right, vp.origin_x, g_camera.render_shift_x());
+             "EdgeProfile: vp.left=%d vp.right=%d vp.top=%d vp.bottom=%d "
+             "origin_x=%d shift_x=%.2f cell=%d\n",
+             vp.left, vp.right, vp.top, vp.bottom,
+             vp.origin_x, g_camera.render_shift_x(), vp.cell_size);
     g_telemetry_log += buf;
+    int max_left_gap = 0;
+    int max_right_gap = 0;
     for (int i = 0; i < 3; i++) {
         int ls, re;
         edge_profile_scan_row(renderer, w, rows[i], &ls, &re);
+        const int left_gap = (ls >= 0) ? (vp.left - ls) : -1;
+        const int right_gap = (re >= 0) ? (re - (vp.right - 1)) : -1;
+        if (left_gap > max_left_gap) max_left_gap = left_gap;
+        if (right_gap > max_right_gap) max_right_gap = right_gap;
         snprintf(buf, sizeof(buf),
-                 "  row y=%d leftContentStart=%d rightContentEnd=%d rightMargin=%d\n",
-                 rows[i], ls, re, (re >= 0 ? (w - 1 - re) : -1));
+                 "  row y=%d leftContentStart=%d rightContentEnd=%d "
+                 "leftGap=%d rightGap=%d rightMargin=%d\n",
+                 rows[i], ls, re, left_gap, right_gap,
+                 (re >= 0 ? (w - 1 - re) : -1));
         g_telemetry_log += buf;
     }
 }
@@ -612,7 +730,9 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
         } else {
             g_clip_log_remaining = 40;
             if (g_test_dump_frames > 0) {
-                edge_profile_log(renderer);
+                if (df::global::gps) {
+                    edge_profile_log(renderer);
+                }
             }
             if (g_test_dump_frames > 0 && True_SDL_RenderReadPixels && True_SDL_CreateRGBSurfaceWithFormat &&
                 True_SDL_SaveBMP_RW && True_SDL_RWFromFile && True_SDL_FreeSurface) {
@@ -622,7 +742,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                     if (surface) {
                         if (True_SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888, surface->pixels, surface->pitch) == 0) {
                             char filename[256];
-                            snprintf(filename, sizeof(filename), "smoothpan_frame_%d.bmp", g_test_dump_frames);
+                            snprintf(filename, sizeof(filename), "%s%d.bmp",
+                                     telemetry_bmp_prefix().c_str(), g_test_dump_frames);
                             std::string path = smoothpan_log_path(filename);
                             SDL_RWops* rwops = True_SDL_RWFromFile(path.c_str(), "wb");
                             if (rwops) {
@@ -663,6 +784,25 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                     fprintf(f, "  map_port pixel_perc=(%d,%d) dim=(%d,%d)\n",
                             mp->pixel_perc_x, mp->pixel_perc_y, mp->dim_x, mp->dim_y);
                 }
+                if (g_test_dump_frames > 0 && df::global::gps && df::global::gps->main_viewport) {
+                    auto* mvp = df::global::gps->main_viewport;
+                    // 3.23.2: read cell from gps->viewport_zoom_factor/4
+                    // (the natural cell for the main viewport), not from
+                    // r2d->dispx_z.  The 3.23.1 diagnostic revealed that
+                    // r2d->dispx_z can be a stale value (e.g. 14 when the
+                    // main viewport actually renders at 48).  zf/4 is the
+                    // single source of truth for the main viewport cell.
+                    int cell_x = 0, cell_y = 0;
+                    int zf = df::global::gps->viewport_zoom_factor;
+                    if (zf > 0) {
+                        cell_x = zf / 4;
+                        cell_y = zf / 4;
+                    }
+                    fprintf(f, "  main_viewport dim=(%d,%d) cell=(%d,%d) zf=%d screen=(%d,%d)\n",
+                            mvp->dim_x, mvp->dim_y,
+                            cell_x, cell_y, zf,
+                            mvp->screen_x, mvp->screen_y);
+                }
                 // Mouse diagnostics: compare the raw SDL mouse (via the original
                 // trampoline, no compensation) against DF's resolved mouse tile /
                 // pixel.  Lets us see whether our SDL_GetMouseState compensation
@@ -701,16 +841,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                     fprintf(f, "  mmb held=%d drag=%d scroll=%d gate=%d sticky=%d anchor_delta=(%d,%d)\n",
                             g_sp_mmb_held, g_sp_middle_drag, g_sp_mmb_scroll,
                             g_sp_mmb_gate, g_sp_mmb_sticky, g_sp_mmb_dx, g_sp_mmb_dy);
-                    fprintf(f, "  zoom anim=%d hold=%d dir=%d gps_z=%d baked=%d target=%d pending=%d "
-                               "intercept=%d fail=%d fallback=%d t=%d scale=%d s0=%d\n",
-                            g_sp_zoom_anim, g_sp_zoom_hold, g_sp_zoom_dir,
-                            df::global::gps ? df::global::gps->viewport_zoom_factor : 0,
-                            g_sp_zoom_baked, g_sp_zoom_target,
-                            g_sp_zoom_pending, g_sp_zoom_intercept, g_sp_zoom_commit_fail,
-                            g_sp_zoom_fallback,
-                            static_cast<int>(smoothpan_zoom_anim_t() * 100.0f),
-                            static_cast<int>(smoothpan_zoom_render_scale() * 100.0f),
-                            static_cast<int>(smoothpan_zoom_start_scale_value() * 100.0f));
+                    fprintf(f, "  zoom pan-only gps_z=%d (wheel=vanilla)\n",
+                            df::global::gps ? df::global::gps->viewport_zoom_factor : 0);
                     zoom_probe_write_f9(f);
                     zoom_probe_flush_discovery_log();
                     fprintf(f, "  desig active=%d paint=%d drag=%d patched_mx,my=(%d,%d) mpos=(%d,%d) "
@@ -720,6 +852,49 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                             g_sp_desig_mpos_x, g_sp_desig_mpos_y,
                             g_sp_desig_sel_sx, g_sp_desig_sel_sy, g_sp_desig_sel_sz,
                             g_sp_desig_sel_ex, g_sp_desig_sel_ey, g_sp_desig_sel_ez);
+                    // World cursor (df::global::cursor) at F9 time — DF resets
+                    // this to (-30000) at end of frame, so this is usually the
+                    // sentinel.  The rend_start/rend_end captures below are the
+                    // authoritative values.
+                    if (df::global::cursor) {
+                        int cur_x = df::global::cursor->x;
+                        int cur_y = df::global::cursor->y;
+                        int cur_z = df::global::cursor->z;
+                        int gps_px = df::global::gps ? df::global::gps->precise_mouse_x : 0;
+                        int gps_py = df::global::gps ? df::global::gps->precise_mouse_y : 0;
+                        int cell_sz = mvp.cell_size > 0 ? mvp.cell_size : 16;
+                        int exp_x = mvp.left + gps_px / cell_sz;
+                        int exp_y = mvp.top  + gps_py / cell_sz;
+                        fprintf(f, "  world_cursor_f9=(%d,%d,%d) expected_from_precise_f9=(%d,%d) cell=%d vp=(%d,%d)\n",
+                                cur_x, cur_y, cur_z, exp_x, exp_y, cell_sz, mvp.left, mvp.top);
+                    }
+                    // Cursor captured at start/end of render interpose — these
+                    // are the values DF uses to anchor the building ghost.
+                    fprintf(f, "  world_cursor_rend_start=(%d,%d,%d) precise_start=(%d,%d) "
+                               "rend_end=(%d,%d,%d) precise_end=(%d,%d)\n",
+                            g_sp_cur_rend_start_x, g_sp_cur_rend_start_y, g_sp_cur_rend_start_z,
+                            g_sp_cur_precise_rend_start_x, g_sp_cur_precise_rend_start_y,
+                            g_sp_cur_rend_end_x,   g_sp_cur_rend_end_y,   g_sp_cur_rend_end_z,
+                            g_sp_cur_precise_rend_end_x,   g_sp_cur_precise_rend_end_y);
+                    // Mode state — tells us whether user is actually in
+                    // BUILDING_PLACEMENT / ZONE_PAINT / etc.
+                    if (df::global::game) {
+                        auto& mi = df::global::game->main_interface;
+                        fprintf(f, "  mode bottom=%d desig=%d cursor_xy=(%d,%d)\n",
+                                (int)mi.bottom_mode_selected,
+                                (int)mi.main_designation_selected,
+                                df::global::gps ? df::global::gps->mouse_x : -1,
+                                df::global::gps ? df::global::gps->mouse_y : -1);
+                    }
+                    // Last wants_render trace — which sub-check passed/failed.
+                    fprintf(f, "  wants_render last=%d drag=%d placement=%d overmap=%d in=(%d,%d)\n",
+                            g_sp_wants_render_last, g_sp_wants_render_drag,
+                            g_sp_wants_render_placement, g_sp_wants_render_overmap,
+                            g_sp_wants_render_ux, g_sp_wants_render_uy);
+                    // designation_over_map sub-check trace.
+                    fprintf(f, "  overmap inui=%d widget=%d gate=%d raw=(%d,%d)\n",
+                            g_sp_overmap_inui, g_sp_overmap_widget,
+                            g_sp_overmap_gate, g_sp_overmap_rawx, g_sp_overmap_rawy);
                     fprintf(f, "  lastclick #%d keys=%d reason=%d raw=(%d,%d) "
                                "shift=(%d,%d) mx %d->%d inui=%d vp=[%d,%d..%d,%d] "
                                "wdg=%s[%d,%d..%d,%d]\n",
@@ -761,6 +936,23 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                         g_frame_tile_shifted, g_frame_tile_total, tile_rate,
                         g_frame_sprite_shifted, g_frame_sprite_total, sprite_rate,
                         log_path.c_str());
+                // Stage 1 (3.21.0) zoom black-band diagnostics.  ztrans>0 means
+                // we are inside the post-zoom transition window (clip relaxed);
+                // constrain=1 means the origin clip WAS imposed this frame.
+                // map_clipped_out>0 is direct evidence the clip discarded map
+                // blits (Problem A / black bands).
+                fprintf(f, "  ZoomDiag: gps_z=%d prev_z=%d ztrans=%d constrain=%d clip_set=%d shift=(%.2f,%.2f)\n",
+                        df::global::gps ? df::global::gps->viewport_zoom_factor : 0,
+                        g_zoom_prev_z.load(std::memory_order_relaxed),
+                        g_zoom_transition_frames.load(std::memory_order_relaxed),
+                        map_clip_should_constrain() ? 1 : 0,
+                        g_active_clip_set ? 1 : 0,
+                        g_camera.render_shift_x(), g_camera.render_shift_y());
+                fprintf(f, "  ClipStarve: clip=(%d,%d,%d,%d) set=%d map_total=%d map_clipped_out=%d\n",
+                        g_active_clip_rect.x, g_active_clip_rect.y,
+                        g_active_clip_rect.w, g_active_clip_rect.h,
+                        g_active_clip_set ? 1 : 0,
+                        g_frame_map_total, g_frame_map_clip_out);
                 g_frame_blit_total = 0;
                 g_frame_blit_shifted = 0;
                 g_frame_map_total = 0;
@@ -771,6 +963,7 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                 g_frame_sprite_shifted = 0;
                 g_frame_pass_shifted = 0;
                 g_frame_ui_leak_shifted = 0;
+                g_frame_map_clip_out = 0;
                 if (g_test_dump_frames > 0) {
                     ViewportRect vp;
                     if (get_strict_viewport_rect(&vp)) {
@@ -788,7 +981,6 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
         g_telemetry_log.clear();
     }
 
-    smoothpan_zoom_on_present(g_frame_map_shifted, g_frame_map_total);
     g_frame_blit_total = 0;
     g_frame_blit_shifted = 0;
     g_frame_map_total = 0;
@@ -799,10 +991,14 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     g_frame_sprite_shifted = 0;
     g_frame_pass_shifted = 0;
     g_frame_ui_leak_shifted = 0;
+    g_frame_map_clip_out = 0;
 
-    // All SDL blits for this frame have fired.  Now that render_shift_x()
-    // has been used, it is safe to clear the overscan state and take the
-    // per-frame snapshot.
+    // Stage 1: count down the post-zoom transition window once per present.
+    {
+        int zt = g_zoom_transition_frames.load(std::memory_order_relaxed);
+        if (zt > 0) g_zoom_transition_frames.store(zt - 1, std::memory_order_relaxed);
+    }
+
     g_camera.end_render_overscan();
 
     probe_on_present();
@@ -825,11 +1021,15 @@ int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_
     }
     if (dstrect && True_SDL_RenderCopyF) {
         int sx = 0, sy = 0;
-        if (process_map_blit(dstrect->x, dstrect->y, dstrect->w, dstrect->h, &sx, &sy)) {
+        int src_x = srcrect ? srcrect->x : 0;
+        int src_y = srcrect ? srcrect->y : 0;
+        int src_w = srcrect ? srcrect->w : 0;
+        int src_h = srcrect ? srcrect->h : 0;
+        if (process_map_blit(src_x, src_y, src_w, src_h, dstrect->x, dstrect->y, dstrect->w, dstrect->h, &sx, &sy)) {
             SDL_FRect orig_f  = { static_cast<float>(dstrect->x), static_cast<float>(dstrect->y),
                                   static_cast<float>(dstrect->w), static_cast<float>(dstrect->h) };
             SDL_FRect shifted = orig_f;
-            map_blit_apply_pan_and_zoom(&shifted, nullptr);
+            map_blit_apply_pan_shift(&shifted, nullptr);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
             return True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
         }
@@ -846,7 +1046,11 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
     }
     if (dstrect && True_SDL_RenderCopyExF) {
         int sx = 0, sy = 0;
-        if (process_map_blit(dstrect->x, dstrect->y, dstrect->w, dstrect->h, &sx, &sy)) {
+        int src_x = srcrect ? srcrect->x : 0;
+        int src_y = srcrect ? srcrect->y : 0;
+        int src_w = srcrect ? srcrect->w : 0;
+        int src_h = srcrect ? srcrect->h : 0;
+        if (process_map_blit(src_x, src_y, src_w, src_h, dstrect->x, dstrect->y, dstrect->w, dstrect->h, &sx, &sy)) {
             SDL_FRect orig_f  = { static_cast<float>(dstrect->x), static_cast<float>(dstrect->y),
                                   static_cast<float>(dstrect->w), static_cast<float>(dstrect->h) };
             SDL_FRect shifted = orig_f;
@@ -857,7 +1061,7 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
                 center_f.y = static_cast<float>(center->y);
                 center_fp = &center_f;
             }
-            map_blit_apply_pan_and_zoom(&shifted, center_fp);
+            map_blit_apply_pan_shift(&shifted, center_fp);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
             return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center_fp, flip);
         }
@@ -866,13 +1070,12 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
 }
 
 // Last column/row tiles: stretch dst to the viewport edge in the same blit as
-// the pan shift so gap width tracks render_shift every frame (no second pass).
+// the pan shift so gaps track render state every frame (no second pass).
 static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shifted) {
     if (!orig || !shifted || orig->w <= 0.0f || orig->h <= 0.0f) return;
 
     const float sx = g_camera.render_shift_x();
     const float sy = g_camera.render_shift_y();
-    if (sx < 0.5f && sy < 0.5f) return;
 
     ViewportRect vp;
     if (!get_strict_viewport_rect(&vp)) return;
@@ -886,22 +1089,32 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
     const float tile_right  = static_cast<float>(origin_x + (vp.right  - vp.left));
     const float tile_bottom = static_cast<float>(origin_y + (vp.bottom - vp.top));
 
-    const bool is_last_col = sx >= 0.5f && std::abs(orig->x + orig->w - tile_right)  < 2.0f;
-    const bool is_last_row = sy >= 0.5f && std::abs(orig->y + orig->h - tile_bottom) < 2.0f;
+    const bool is_first_col = std::abs(orig->x - static_cast<float>(origin_x)) < 2.0f;
+    const bool is_last_col  = std::abs(orig->x + orig->w - tile_right)  < 2.0f;
+    const bool is_first_row = std::abs(orig->y - static_cast<float>(origin_y)) < 2.0f;
+    const bool is_last_row  = std::abs(orig->y + orig->h - tile_bottom) < 2.0f;
+
+    const bool extend_right = is_last_col && sx >= 0.5f;
+    const bool extend_bottom = is_last_row && sy >= 0.5f;
+    const bool extend_left = is_first_col && sx <= -0.5f;
+    const bool extend_top = is_first_row && sy <= -0.5f;
+
+    if (!extend_right && !extend_bottom && !extend_left && !extend_top) return;
 
     if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
         char buf[320];
         snprintf(buf, sizeof(buf),
             "EdgeScan: orig=(%.0f,%.0f +%.0fx%.0f) vp=(%d..%d,%d..%d) "
-            "origin=(%d,%d) tr=%.0f tb=%.0f sx=%.1f sy=%.1f col=%d row=%d\n",
+            "origin=(%d,%d) tr=%.0f tb=%.0f sx=%.1f sy=%.1f "
+            "L=%d R=%d T=%d B=%d\n",
             orig->x, orig->y, orig->w, orig->h,
             vp.left, vp.right, vp.top, vp.bottom,
             origin_x, origin_y, tile_right, tile_bottom,
-            sx, sy, is_last_col ? 1 : 0, is_last_row ? 1 : 0);
+            sx, sy,
+            extend_left ? 1 : 0, extend_right ? 1 : 0,
+            extend_top ? 1 : 0, extend_bottom ? 1 : 0);
         g_telemetry_log += buf;
     }
-
-    if (!is_last_col && !is_last_row) return;
 
     LARGE_INTEGER edge_t0, edge_t1, edge_freq;
     const bool time_edge = perf_is_active();
@@ -910,7 +1123,31 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
         QueryPerformanceCounter(&edge_t0);
     }
 
-    if (is_last_col) {
+    if (extend_left) {
+        const float target_x = static_cast<float>(vp.left);
+        const float extra = shifted->x - target_x;
+        shifted->x = target_x;
+        shifted->w += extra;
+        if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  EdgeScale: left +%.1f w -> %.1f\n", extra, shifted->w);
+            g_telemetry_log += buf;
+        }
+    }
+
+    if (extend_top) {
+        const float target_y = static_cast<float>(vp.top);
+        const float extra = shifted->y - target_y;
+        shifted->y = target_y;
+        shifted->h += extra;
+        if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  EdgeScale: top +%.1f h -> %.1f\n", extra, shifted->h);
+            g_telemetry_log += buf;
+        }
+    }
+
+    if (extend_right) {
         const float target_w = static_cast<float>(vp.right) - shifted->x;
         if (target_w > shifted->w + 0.5f) {
             if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
@@ -923,7 +1160,7 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
         }
     }
 
-    if (is_last_row) {
+    if (extend_bottom) {
         const float target_h = static_cast<float>(vp.bottom) - shifted->y;
         if (target_h > shifted->h + 0.5f) {
             if ((g_test_dump_frames > 0 || g_classify_log_frames > 0) && g_test_dump_delay == 0) {
@@ -957,10 +1194,14 @@ int Hook_SDL_RenderCopyF(SDL_Renderer* renderer, SDL_Texture* texture, const SDL
         }
     }
     if (dstrect && True_SDL_RenderCopyF) {
-        if (process_map_blit_f(dstrect->x, dstrect->y, dstrect->w, dstrect->h)) {
+        float src_x = srcrect ? static_cast<float>(srcrect->x) : 0.0f;
+        float src_y = srcrect ? static_cast<float>(srcrect->y) : 0.0f;
+        float src_w = srcrect ? static_cast<float>(srcrect->w) : 0.0f;
+        float src_h = srcrect ? static_cast<float>(srcrect->h) : 0.0f;
+        if (process_map_blit_f(src_x, src_y, src_w, src_h, dstrect->x, dstrect->y, dstrect->w, dstrect->h)) {
             SDL_FRect orig_f = *dstrect;
             SDL_FRect shifted = orig_f;
-            map_blit_apply_pan_and_zoom(&shifted, nullptr);
+            map_blit_apply_pan_shift(&shifted, nullptr);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
             return True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
         }
@@ -982,7 +1223,11 @@ int Hook_SDL_RenderCopyExF(SDL_Renderer* renderer, SDL_Texture* texture, const S
         }
     }
     if (dstrect && True_SDL_RenderCopyExF) {
-        if (process_map_blit_f(dstrect->x, dstrect->y, dstrect->w, dstrect->h)) {
+        float src_x = srcrect ? static_cast<float>(srcrect->x) : 0.0f;
+        float src_y = srcrect ? static_cast<float>(srcrect->y) : 0.0f;
+        float src_w = srcrect ? static_cast<float>(srcrect->w) : 0.0f;
+        float src_h = srcrect ? static_cast<float>(srcrect->h) : 0.0f;
+        if (process_map_blit_f(src_x, src_y, src_w, src_h, dstrect->x, dstrect->y, dstrect->w, dstrect->h)) {
             SDL_FRect orig_f = *dstrect;
             SDL_FRect shifted = orig_f;
             SDL_FPoint center_f;
@@ -991,7 +1236,7 @@ int Hook_SDL_RenderCopyExF(SDL_Renderer* renderer, SDL_Texture* texture, const S
                 center_f = *center;
                 center_fp = &center_f;
             }
-            map_blit_apply_pan_and_zoom(&shifted, center_fp);
+            map_blit_apply_pan_shift(&shifted, center_fp);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
             return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center_fp, flip);
         }

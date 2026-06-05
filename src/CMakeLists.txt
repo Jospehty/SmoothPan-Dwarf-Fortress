@@ -26,6 +26,5 @@ dfhack_plugin(smoothpan
     ffd_policy.cpp
     frame_seq.cpp
     zoom_probe.cpp
-    zoom_camera.cpp
     ${MINHOOK_SRCS}
 )
