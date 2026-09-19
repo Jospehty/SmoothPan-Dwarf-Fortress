@@ -13,6 +13,9 @@
 #include "renderer_hook.h"
 #include "perf.h"
 #include "designation_sync.h"
+#include "sdl_fn.h"
+#include "compositor.h"
+#include "zoom_camera.h"
 #include "VTableInterpose.h"
 #include "MinHook.h"
 #include <SDL.h>
@@ -35,17 +38,19 @@
 #include <atomic>
 #include <vector>
 
+// Shared typedefs (RenderCopyF, SetClipRect, SetRenderTarget, SetViewport,
+// GetRendererOutputSize) live in sdl_fn.h so compositor.cpp can call the
+// trampolines directly.
 typedef int(*SDL_RenderCopy_t)(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_Rect*);
 typedef int(*SDL_RenderCopyEx_t)(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_Rect*, const double, const SDL_Point*, const SDL_RendererFlip);
-typedef int(*SDL_RenderCopyF_t)(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_FRect*);
 typedef int(*SDL_RenderCopyExF_t)(SDL_Renderer*, SDL_Texture*, const SDL_Rect*, const SDL_FRect*, const double, const SDL_FPoint*, const SDL_RendererFlip);
-typedef int(*SDL_GetRendererOutputSize_t)(SDL_Renderer*, int*, int*);
 typedef void(*SDL_RenderPresent_t)(SDL_Renderer*);
 typedef uint32_t(*SDL_GetMouseState_t)(int*, int*);
 typedef uint32_t(*SDL_GetGlobalMouseState_t)(int*, int*);
-typedef int(*SDL_RenderSetClipRect_t)(SDL_Renderer*, const SDL_Rect*);
-typedef int(*SDL_SetRenderTarget_t)(SDL_Renderer*, SDL_Texture*);
-typedef int(*SDL_RenderSetViewport_t)(SDL_Renderer*, const SDL_Rect*);
+typedef int(*SDL_RenderFillRect_t)(SDL_Renderer*, const SDL_Rect*);
+typedef int(*SDL_RenderFillRectF_t)(SDL_Renderer*, const SDL_FRect*);
+static SDL_RenderFillRect_t True_SDL_RenderFillRect = nullptr;
+static SDL_RenderFillRectF_t True_SDL_RenderFillRectF = nullptr;
 
 SDL_RenderCopy_t True_SDL_RenderCopy = nullptr;
 SDL_RenderCopyEx_t True_SDL_RenderCopyEx = nullptr;
@@ -234,8 +239,17 @@ static void apply_mouse_shift(int& mx, int& my) {
     // drawn under it.  The previous static (screen_x - origin_x) term added a
     // constant ~18px offset to every query, double-compensating and scaling
     // badly with zoom (the "off by a few tiles" desync).  Removed.
-    mx += static_cast<int>(std::lround(g_camera.render_shift_x()));
-    my += static_cast<int>(std::lround(g_camera.render_shift_y()));
+    // 3.24.0: while the compositor shows the map scaled about an anchor,
+    // first undo that scale (screen -> bake space), then the pan shift.
+    float zs = 1.0f, zax = 0.0f, zay = 0.0f;
+    float fx = static_cast<float>(mx);
+    float fy = static_cast<float>(my);
+    if (zoom_camera_display_transform(&zs, &zax, &zay)) {
+        fx = zax + (fx - zax) / zs;
+        fy = zay + (fy - zay) / zs;
+    }
+    mx = static_cast<int>(std::lround(fx + g_camera.render_shift_x()));
+    my = static_cast<int>(std::lround(fy + g_camera.render_shift_y()));
 }
 
 static void compensate_mouse(int* x, int* y) {
@@ -281,7 +295,33 @@ int Hook_SDL_SetRenderTarget(SDL_Renderer* renderer, SDL_Texture* texture) {
     }
     if (g_probe_frames > 0 || probe_auto_cycle_active()) probe_note_target_event();
     if (trace_is_active()) trace_on_set_render_target(texture);
+    // 3.24.0: while a map pass is being captured, DF re-selecting its screen
+    // target must keep our capture texture bound (DF's own other targets pass
+    // through untouched).
+    if (is_enabled) {
+        int res = 0;
+        if (compositor_on_set_render_target(renderer, texture, &res)) return res;
+    }
     return True_SDL_SetRenderTarget(renderer, texture);
+}
+
+// 3.24.0: solid fills are how a HUD panel background may start the HUD phase;
+// the compositor uses them (like non-map blits) to end the captured map layer.
+int Hook_SDL_RenderFillRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
+    if (is_enabled && compositor_capturing()) {
+        if (rect) compositor_on_fill(renderer, static_cast<float>(rect->x), static_cast<float>(rect->y),
+                                     static_cast<float>(rect->w), static_cast<float>(rect->h));
+        else compositor_on_fill(renderer, 0.0f, 0.0f, 1e6f, 1e6f);
+    }
+    return True_SDL_RenderFillRect(renderer, rect);
+}
+
+int Hook_SDL_RenderFillRectF(SDL_Renderer* renderer, const SDL_FRect* rect) {
+    if (is_enabled && compositor_capturing()) {
+        if (rect) compositor_on_fill(renderer, rect->x, rect->y, rect->w, rect->h);
+        else compositor_on_fill(renderer, 0.0f, 0.0f, 1e6f, 1e6f);
+    }
+    return True_SDL_RenderFillRectF(renderer, rect);
 }
 
 int Hook_SDL_RenderSetViewport(SDL_Renderer* renderer, const SDL_Rect* rect) {
@@ -397,6 +437,31 @@ int Hook_SDL_RenderSetClipRect(SDL_Renderer* renderer, const SDL_Rect* rect) {
 
 // Forward declaration — extend last grid tile to viewport edge (see below).
 static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shifted);
+
+// 3.24.0 compositor routing for a map-class blit that has been pan-shifted.
+// Inside a captured pass the blit lands in the capture texture (record it).
+// After the map passes (post-viewport lower-z stragglers) it goes straight to
+// DF's target, so it must carry the frame's zoom transform itself — or be
+// dropped when the frame is showing the retained previous bake.
+// Returns false when the blit must not be drawn at all.
+// Classification of the most recent blit seen by process_map_blit(_f)
+// (true = map content), for the compositor's layer-end heuristic.
+static bool g_last_blit_map_class = false;
+
+static bool route_shifted_map_blit(SDL_Renderer* r, SDL_FRect* shifted) {
+    if (compositor_capturing()) {
+        compositor_on_blit(r, shifted->x, shifted->y, shifted->w, shifted->h, true, true);
+        return true;
+    }
+    if (compositor_layer_done()) {
+        return compositor_post_blit(shifted);
+    }
+    return true;
+}
+
+static void note_passthrough_blit(SDL_Renderer* r, float x, float y, float w, float h) {
+    if (compositor_capturing()) compositor_on_blit(r, x, y, w, h, g_last_blit_map_class, false);
+}
 
 static void map_blit_apply_pan_shift(SDL_FRect* rect, SDL_FPoint* center_opt) {
     const float fsx = g_camera.render_shift_x();
@@ -585,6 +650,7 @@ static bool process_map_blit(int src_x, int src_y, int src_w, int src_h, int x, 
         }
     };
 
+    g_last_blit_map_class = false;
     if (trace_is_active()) { finish(false, 0); return false; }
     if (!is_enabled || !sdl_shift_mode_active()) { finish(false, 0); return false; }
     if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) { finish(false, 0); return false; }
@@ -597,6 +663,7 @@ static bool process_map_blit(int src_x, int src_y, int src_w, int src_h, int x, 
         QueryPerformanceCounter(&q1);
         classify_us = (q1.QuadPart - q_cls.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
     }
+    g_last_blit_map_class = (c.cls == BlitClass::Map);
 
     bool shifted = should_shift_blit(c);
     record_blit_counters(c, shifted);
@@ -631,6 +698,7 @@ static bool process_map_blit_f(float src_x, float src_y, float src_w, float src_
         }
     };
 
+    g_last_blit_map_class = false;
     if (trace_is_active()) { finish(false, 0); return false; }
     if (!is_enabled || !sdl_shift_mode_active()) { finish(false, 0); return false; }
     if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) { finish(false, 0); return false; }
@@ -647,6 +715,7 @@ static bool process_map_blit_f(float src_x, float src_y, float src_w, float src_
         QueryPerformanceCounter(&q1);
         classify_us = (q1.QuadPart - q_cls.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
     }
+    g_last_blit_map_class = (c.cls == BlitClass::Map);
     bool shifted = should_shift_blit(c);
     record_blit_counters(c, shifted);
     log_blit_telemetry_f(c, src_x, src_y, src_w, src_h, x, y, w, h, shifted);
@@ -841,8 +910,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                     fprintf(f, "  mmb held=%d drag=%d scroll=%d gate=%d sticky=%d anchor_delta=(%d,%d)\n",
                             g_sp_mmb_held, g_sp_middle_drag, g_sp_mmb_scroll,
                             g_sp_mmb_gate, g_sp_mmb_sticky, g_sp_mmb_dx, g_sp_mmb_dy);
-                    fprintf(f, "  zoom pan-only gps_z=%d (wheel=vanilla)\n",
-                            df::global::gps ? df::global::gps->viewport_zoom_factor : 0);
+                    compositor_write_f9(f);
+                    zoom_camera_write_f9(f);
                     zoom_probe_write_f9(f);
                     zoom_probe_flush_discovery_log();
                     fprintf(f, "  desig active=%d paint=%d drag=%d patched_mx,my=(%d,%d) mpos=(%d,%d) "
@@ -1009,6 +1078,10 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
 
     perf_on_present(is_enabled);
 
+    // 3.24.0: finalize the retained-frame compositor for this frame (swap the
+    // complete bake into the retained slot, restore DF's target if needed).
+    if (is_enabled) compositor_on_present(renderer);
+
     True_SDL_RenderPresent(renderer);
 }
 
@@ -1031,8 +1104,11 @@ int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_
             SDL_FRect shifted = orig_f;
             map_blit_apply_pan_shift(&shifted, nullptr);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
+            if (!route_shifted_map_blit(renderer, &shifted)) return 0;
             return True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
         }
+        note_passthrough_blit(renderer, static_cast<float>(dstrect->x), static_cast<float>(dstrect->y),
+                              static_cast<float>(dstrect->w), static_cast<float>(dstrect->h));
     }
     return True_SDL_RenderCopy(renderer, texture, srcrect, dstrect);
 }
@@ -1063,8 +1139,11 @@ int Hook_SDL_RenderCopyEx(SDL_Renderer* renderer, SDL_Texture* texture, const SD
             }
             map_blit_apply_pan_shift(&shifted, center_fp);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
+            if (!route_shifted_map_blit(renderer, &shifted)) return 0;
             return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center_fp, flip);
         }
+        note_passthrough_blit(renderer, static_cast<float>(dstrect->x), static_cast<float>(dstrect->y),
+                              static_cast<float>(dstrect->w), static_cast<float>(dstrect->h));
     }
     return True_SDL_RenderCopyEx(renderer, texture, srcrect, dstrect, angle, center, flip);
 }
@@ -1203,8 +1282,10 @@ int Hook_SDL_RenderCopyF(SDL_Renderer* renderer, SDL_Texture* texture, const SDL
             SDL_FRect shifted = orig_f;
             map_blit_apply_pan_shift(&shifted, nullptr);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
+            if (!route_shifted_map_blit(renderer, &shifted)) return 0;
             return True_SDL_RenderCopyF(renderer, texture, srcrect, &shifted);
         }
+        note_passthrough_blit(renderer, dstrect->x, dstrect->y, dstrect->w, dstrect->h);
     }
     return True_SDL_RenderCopyF(renderer, texture, srcrect, dstrect);
 }
@@ -1238,8 +1319,10 @@ int Hook_SDL_RenderCopyExF(SDL_Renderer* renderer, SDL_Texture* texture, const S
             }
             map_blit_apply_pan_shift(&shifted, center_fp);
             map_blit_extend_viewport_edges(&orig_f, &shifted);
+            if (!route_shifted_map_blit(renderer, &shifted)) return 0;
             return True_SDL_RenderCopyExF(renderer, texture, srcrect, &shifted, angle, center_fp, flip);
         }
+        note_passthrough_blit(renderer, dstrect->x, dstrect->y, dstrect->w, dstrect->h);
     }
     return True_SDL_RenderCopyExF(renderer, texture, srcrect, dstrect, angle, center, flip);
 }
@@ -1270,6 +1353,10 @@ bool InitSDLHooks() {
 
     void* render_copy_f_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyF");
     void* render_copy_ex_f_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyExF");
+    void* render_fill_rect_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderFillRect");
+    void* render_fill_rect_f_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderFillRectF");
+    if (render_fill_rect_addr) MH_CreateHook(render_fill_rect_addr, &Hook_SDL_RenderFillRect, reinterpret_cast<LPVOID*>(&True_SDL_RenderFillRect));
+    if (render_fill_rect_f_addr) MH_CreateHook(render_fill_rect_f_addr, &Hook_SDL_RenderFillRectF, reinterpret_cast<LPVOID*>(&True_SDL_RenderFillRectF));
 
     if (render_copy_addr) MH_CreateHook(render_copy_addr, &Hook_SDL_RenderCopy, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopy));
     if (render_copy_ex_addr) MH_CreateHook(render_copy_ex_addr, &Hook_SDL_RenderCopyEx, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopyEx));

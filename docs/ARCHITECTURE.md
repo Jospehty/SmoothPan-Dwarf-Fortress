@@ -2,7 +2,7 @@
 
 How SmoothPan implements smooth sub-tile panning in **Dwarf Fortress Premium** (DF 50.x) without modifying the game binary.
 
-**Version documented:** 3.15.0 (stable pan/MMB + experimental smooth zoom). Smooth zoom plan: [PLAN_SMOOTH_ZOOM.md](PLAN_SMOOTH_ZOOM.md).
+**Version documented:** 3.24.0 (stable pan/MMB + retained-frame compositor + smooth zoom). Smooth zoom design and test protocol: [SMOOTH_ZOOM.md](SMOOTH_ZOOM.md).
 
 ---
 
@@ -144,12 +144,18 @@ Interposes `df::renderer_2d`:
 | `SDL_RenderCopy` / `Ex` | Map blit, classified | Subtract `lround(render_shift)` from dest |
 | `SDL_RenderCopyF` / `ExF` | Entity / float blits | Subtract float `render_shift` |
 | `SDL_RenderSetClipRect` | Map pass | Log / snap clip (telemetry) |
-| `SDL_RenderPresent` | Always (when enabled) | F7/F9 dumps; perf frame timing |
+| `SDL_RenderPresent` | Always (when enabled) | F7/F9 dumps; perf frame timing; compositor finalize |
+| `SDL_SetRenderTarget` | Capturing | Keep the capture texture bound when DF re-selects its screen target |
+| `SDL_RenderFillRect` / `F` | Capturing | HUD-start detection for the compositor |
 | `SDL_GetMouseState` | Debug `both` mode only | Off in production GPS mode |
 
 Shift is applied only when `g_in_main_viewport_update` or controlled post-viewport map compositing is active — **not** for HUD overlays drawn afterward.
 
-**Edge gaps (3.14.1+):** Sub-tile pan shifts map blits left/up, leaving an unbaked strip on the right/bottom. The viewport buffer is fixed-size (`dim_x × dim_y`); painting outside it requires vanilla rebake/realloc — not safe to hack. Instead, edge grid tiles extend their **destination width/height in float** to the viewport edge in the **same** `RenderCopyF` as the pan shift (`map_blit_extend_viewport_edges`). Pan uses trailing right/bottom; **smooth zoom (3.15.0)** also extends first column/row to `vp.left`/`vp.top` while SDL scale eases toward 1.0. Toggle: `smoothpan zoom off` for vanilla stepped zoom.
+**Edge gaps (3.14.1+):** Sub-tile pan shifts map blits left/up, leaving an unbaked strip on the right/bottom. The viewport buffer is fixed-size (`dim_x × dim_y`); painting outside it requires vanilla rebake/realloc — not safe to hack. Instead, edge grid tiles extend their **destination width/height in float** to the viewport edge in the **same** `RenderCopyF` as the pan shift (`map_blit_extend_viewport_edges`).
+
+### 4. Retained-frame compositor (`compositor.cpp`, 3.24.0)
+
+From the first map-tile pass of a frame until the HUD starts drawing, the SDL render target is redirected to a screen-sized texture SmoothPan owns. All map passes and anything DF draws between them land there in order, with the per-blit pan shift/edge extend applied **inside** the texture exactly as before. The layer is then drawn back with one `RenderCopyF` carrying the zoom transform (`scale ≥ 1` about the cursor anchor; pixel-exact 1:1 at rest). The previous complete frame is retained and shown instead whenever vanilla's zoom rebake produces a partial (NARROW) bake — the dim-lag fix without writing DF memory. `smoothpan compositor off` restores the direct path. See [SMOOTH_ZOOM.md](SMOOTH_ZOOM.md).
 
 All hooks no-op when `is_enabled == false`.
 
@@ -201,7 +207,7 @@ Never bump `mouse_x/y` or `window_x/y` for mouse sync.
 - Velocity-based pan with friction; direction from held keys
 - Edge clamp against world bounds
 - `freeze_render_frac()` at render start — **one shift per frame**, no Present-time resnapshot
-- Zoom change resyncs `true_x/y` from current `window_x/y`
+- Zoom commits move `true_x/y` so the world point under the zoom anchor is preserved (`zoom_camera.cpp`); external `window_x/y` moves are detected and the anchor re-applied
 
 ### Minimap integration
 
@@ -279,6 +285,10 @@ All paths via `debug_paths.cpp` → `{dfhack-config}/smoothpan/`.
 | `perf.cpp` | F7 detailed FPS profiler |
 | `shift_mode.cpp` | A/B shift backend enum (SDL production path) |
 | `probe.cpp` / `trace.cpp` | Pipeline instrumentation |
+| `compositor.cpp` | Retained-frame map compositor (capture target, bridge, single composite) |
+| `zoom_camera.cpp` | Smooth zoom: eased visual cell, ladder commits, anchor invariance |
+| `zoom_probe.cpp` | Zoom event telemetry (F9) |
+| `sdl_fn.h` | Shared SDL trampoline pointers |
 | `debug_paths.cpp` | Portable log paths |
 | `frame_seq.cpp` | Frame sequencing helpers |
 | `version.h` | `SMOOTHPAN_BUILD_VERSION` string |
@@ -296,7 +306,8 @@ Bundled: **MinHook**, **SDL2** headers (hook targets game's SDL2.dll at runtime)
 | Shift all SDL blits | HUD jiggles |
 | Shift only tile-sized blits | Float entity sprites judder |
 | Mutating `dim_x/y` during viewport bake without realloc | Buffer overrun — diagonal garbage, crash (3.13.6) |
-| SDL zoom scale > 1 without margin texels | Black bands + fill-in as scale eases (3.13.4–3.13.6) |
+| Scale map blits individually / scale < 1 on a bake | Missing texels, cracks, never reached the screen (3.13–3.19) — replaced by the compositor's single composite at scale ≥ 1 |
+| Write `dispx_z` / `vp->dim` on zoom commit frames | Broke the HUD / crashed (3.23.x) — the compositor bridges those presents instead |
 | Overscan without render_shift compensation | Asymmetric gaps; 3.4.0 regression |
 | Separate edge fill blits | Second pass desync / shimmer; integrated tile stretch preferred (3.14.1) |
 | GPS + SDL hook both at boot | Double compensation |

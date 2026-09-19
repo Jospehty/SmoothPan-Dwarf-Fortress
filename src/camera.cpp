@@ -16,6 +16,7 @@
 #include "viewport.h"
 #include "sdl_hook.h"
 #include "zoom_probe.h"
+#include "zoom_camera.h"
 #include <cstdio>
 #include <cstring>
 
@@ -343,8 +344,13 @@ void smoothpan_middle_mouse_update() {
     g_sp_mmb_dx = px - g_mmb_anchor_px;
     g_sp_mmb_dy = py - g_mmb_anchor_py;
 
-    g_camera.true_x = g_mmb_anchor_true_x - static_cast<double>(g_sp_mmb_dx) / cell;
-    g_camera.true_y = g_mmb_anchor_true_y - static_cast<double>(g_sp_mmb_dy) / cell;
+    // While a smooth-zoom ease is showing the bake scaled, one tile spans the
+    // visual cell (px), not the baked cell, so the grab tracks the cursor.
+    double px_per_tile = static_cast<double>(cell);
+    float visual = zoom_camera_visual_cell();
+    if (visual > 1.0f) px_per_tile = static_cast<double>(visual);
+    g_camera.true_x = g_mmb_anchor_true_x - static_cast<double>(g_sp_mmb_dx) / px_per_tile;
+    g_camera.true_y = g_mmb_anchor_true_y - static_cast<double>(g_sp_mmb_dy) / px_per_tile;
     g_camera.commit_true_position();
 }
 
@@ -592,12 +598,14 @@ void SmoothCamera::update() {
     int expected_win_x = static_cast<int>(std::floor(true_x));
     int expected_win_y = static_cast<int>(std::floor(true_y));
     
+    external_window_move = false;
     if (win_x != expected_win_x || win_y != expected_win_y) {
         if (middle_drag_active) {
             commit_true_position();
             win_x = *df::global::window_x;
             win_y = *df::global::window_y;
         } else {
+            external_window_move = true;
             true_x = win_x + static_cast<double>(frac_x.load(std::memory_order_relaxed));
             true_y = win_y + static_cast<double>(frac_y.load(std::memory_order_relaxed));
             if (!panning_up && !panning_down && !panning_left && !panning_right) {

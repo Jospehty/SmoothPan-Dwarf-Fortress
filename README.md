@@ -4,7 +4,9 @@ Smooth sub-tile WASD camera panning for **Dwarf Fortress Premium** (DF 50.x), im
 
 The game continues to simulate on integer tile coordinates (`window_x` / `window_y`). Sub-pixel motion is applied only at render time by shifting map SDL blits. Mouse input is compensated so designation, hover, and UI clicks stay aligned with what you see on screen.
 
-**Latest release: [v1.2.0](releases/v1.2.0/)** (plugin build 3.14.1) — stable smooth pan foundation with integrated edge tile stretch (gap-free fast MMB/WASD); smooth zoom parked for a future pass.
+**Latest release: [v1.2.0](releases/v1.2.0/)** (plugin build 3.14.1) — stable smooth pan foundation with integrated edge tile stretch (gap-free fast MMB/WASD).
+
+**In development: 3.24.0 — smooth zoom.** Wheel over the map glides in/out about the cursor (RimWorld-style), built on a retained-frame map compositor that also removes the black rebake bands of vanilla zoom. Design + test protocol: [docs/SMOOTH_ZOOM.md](docs/SMOOTH_ZOOM.md). Build from `src/` with `deploy.ps1`; `smoothpan zoom off` / `smoothpan compositor off` fall back to the 3.23 behaviour.
 
 Previous: [v1.1.0](releases/v1.1.0/) (3.11.52) · [v1.0.0](releases/v1.0.0/) (3.11.46)
 

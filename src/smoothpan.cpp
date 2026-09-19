@@ -34,6 +34,8 @@
 #include "ffd_policy.h"
 #include "designation_sync.h"
 #include "zoom_probe.h"
+#include "zoom_camera.h"
+#include "compositor.h"
 #include <SDL.h>
 #include <cstdio>
 
@@ -209,10 +211,23 @@ static void apply_mouse_compensation(char src) {
     g_sp_comp_my_after = gps->mouse_y;
     g_sp_comp_tx = *df::global::window_x + gps->precise_mouse_x / cell;
     g_sp_comp_ty = *df::global::window_y + gps->precise_mouse_y / cell;
-    if (fsx == 0.0f && fsy == 0.0f) { *reason = 5; return; }
 
-    g_comp_px_add = static_cast<int>(std::lround(fsx));
-    g_comp_py_add = static_cast<int>(std::lround(fsy));
+    // 3.24.0: while the compositor shows the map scaled about an anchor
+    // (screen = a + (bake - a) * s), invert that first so precise_mouse lands in
+    // bake space; then the usual pan-shift bump.  Identity when s == 1.
+    float zs = 1.0f, zax = 0.0f, zay = 0.0f;
+    float inv_dx = 0.0f, inv_dy = 0.0f;
+    const bool zoomed = zoom_camera_display_transform(&zs, &zax, &zay);
+    if (zoomed) {
+        const float rx = static_cast<float>(raw_x);
+        const float ry = static_cast<float>(raw_y);
+        inv_dx = (zax + (rx - zax) / zs) - rx;
+        inv_dy = (zay + (ry - zay) / zs) - ry;
+    }
+    if (fsx == 0.0f && fsy == 0.0f && !zoomed) { *reason = 5; return; }
+
+    g_comp_px_add = static_cast<int>(std::lround(fsx + inv_dx));
+    g_comp_py_add = static_cast<int>(std::lround(fsy + inv_dy));
 
     gps->precise_mouse_x += g_comp_px_add;
     gps->precise_mouse_y += g_comp_py_add;
@@ -253,9 +268,31 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
     typedef df::viewscreen_dwarfmodest interpose_base;
 
     DEFINE_VMETHOD_INTERPOSE(void, feed, (std::set<df::interface_key> *input)) {
-        if (!is_enabled) {
+        if (!is_enabled || g_zoom_inject_depth > 0) {
+            // g_zoom_inject_depth: a synthetic ZOOM key we are handing to
+            // vanilla to commit a ladder step — pass straight through.
             INTERPOSE_NEXT(feed)(input);
             return;
+        }
+
+        // Smooth zoom: wheel / zoom keys move the visual zoom target instead
+        // of snapping vanilla.  Only when the cursor is on the map — over UI
+        // the wheel keeps its vanilla meaning (list scrolling etc.).
+        if (input && (input->count(df::interface_key::ZOOM_IN) ||
+                      input->count(df::interface_key::ZOOM_OUT))) {
+            const int dir = input->count(df::interface_key::ZOOM_IN) ? +1 : -1;
+            if (dir > 0) zoom_probe_note_feed_zoom_in(); else zoom_probe_note_feed_zoom_out();
+            bool over_map = false;
+            {
+                int rx = -1, ry = -1;
+                ViewportRect vp;
+                if (smoothpan_raw_sdl_mouse(&rx, &ry) && get_strict_viewport_rect(&vp))
+                    over_map = smoothpan_middle_mouse_map_gate(rx - vp.origin_x, ry - vp.origin_y);
+            }
+            if (over_map && zoom_camera_on_zoom_key(dir, over_map)) {
+                input->erase(df::interface_key::ZOOM_IN);
+                input->erase(df::interface_key::ZOOM_OUT);
+            }
         }
 
         const bool mmb_held = smoothpan_middle_mouse_button_held();
@@ -437,9 +474,13 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
                 perf_clear_capture_finished();
             }
             g_camera.update();
+            // Smooth zoom: ease the visual cell, request/land ladder commits
+            // (moves true_x/y for anchor invariance) — before the frac freeze.
+            zoom_camera_update(this);
             g_camera.last_snapshot.applied_ppc_x = -1;
             g_camera.last_snapshot.applied_ppc_y = -1;
             g_camera.begin_render_overscan();
+            zoom_camera_freeze();
             apply_map_port_shift();
         }
 
@@ -642,9 +683,57 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
             out.print("  smoothpan minimap interval <ms> — set lazy/outline throttle (80-60000)\n");
             return CR_FAILURE;
         }
-    } else if (parameters.size() >= 2 && parameters[0] == "zoom") {
-        out.print("Smooth wheel zoom was removed in 3.20.0 (pan-only). Wheel uses vanilla DF.\n");
-        out.print("See docs/ZOOM_POSTMORTEM.md for history.\n");
+    } else if (parameters.size() >= 1 && parameters[0] == "zoom") {
+        const std::string sub = parameters.size() >= 2 ? parameters[1] : "status";
+        if (sub == "on") {
+            zoom_camera_set_enabled(true);
+            out.print("Smooth zoom: ON (wheel over map eases; commits through vanilla ladder).\n");
+        } else if (sub == "off") {
+            zoom_camera_set_enabled(false);
+            out.print("Smooth zoom: OFF (wheel = vanilla stepped zoom; compositor still bridges rebake frames).\n");
+        } else if (sub == "rate" && parameters.size() >= 3) {
+            zoom_camera_set_rate(static_cast<float>(std::stod(parameters[2])));
+            out.print("Smooth zoom ease rate: {} /s (higher = snappier; 8..30 sensible).\n", zoom_camera_rate());
+        } else if (sub == "anchor" && parameters.size() >= 3) {
+            const bool cursor = parameters[2] == "cursor" || parameters[2] == "mouse";
+            zoom_camera_set_anchor_cursor(cursor);
+            out.print("Smooth zoom anchor: {}.\n", cursor ? "cursor" : "centre");
+        } else if (sub == "filter" && parameters.size() >= 3) {
+            const bool linear = parameters[2] == "linear" || parameters[2] == "smooth";
+            compositor_set_filter_linear(linear);
+            out.print("Compositor texture filter: {}.\n", linear ? "linear" : "nearest");
+        } else if (sub == "commit" && parameters.size() >= 3) {
+            const bool direct = parameters[2] == "direct";
+            zoom_camera_set_commit_direct(direct);
+            out.print("Smooth zoom commit path: {}.\n",
+                      direct ? "direct set_viewport_zoom_factor" : "vanilla feed ZOOM_IN/OUT");
+        } else if (sub == "test" && parameters.size() >= 3) {
+            const int dir = (parameters[2] == "in") ? +1 : -1;
+            zoom_camera_queue_test_step(dir);
+            out.print("Queued one vanilla ladder step ({}) through the commit path; watch F9 'Zoom:' / smoothpan_zoom.txt.\n",
+                      dir > 0 ? "in" : "out");
+        } else {
+            char buf[320];
+            zoom_camera_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+            compositor_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+            out.print("  smoothpan zoom on|off | rate <n> | anchor cursor|centre | filter linear|nearest | commit feed|direct | test in|out\n");
+        }
+    } else if (parameters.size() >= 1 && parameters[0] == "compositor") {
+        const std::string sub = parameters.size() >= 2 ? parameters[1] : "status";
+        if (sub == "on") {
+            compositor_set_enabled(true);
+            out.print("Compositor: ON (map layer captured to a retained texture; smooth zoom available).\n");
+        } else if (sub == "off") {
+            compositor_set_enabled(false);
+            out.print("Compositor: OFF (direct pan path, exactly as 3.23.x; smooth zoom unavailable).\n");
+        } else {
+            char buf[320];
+            compositor_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+            out.print("  log: {}\n", smoothpan_log_path("smoothpan_compositor.txt"));
+        }
     } else if (parameters.size() >= 2 && parameters[0] == "clip") {
         if (parameters[1] == "legacy" || parameters[1] == "old") {
             smoothpan_set_legacy_clip(true);
@@ -740,6 +829,8 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         out.print("  smoothpan ffd <always|smart|off>       — pan z-rebake policy\n");
         out.print("  smoothpan clip <legacy|gated>          — zoom black-band A/B (gated=fix)\n");
         out.print("  smoothpan zoomcap [<label>] [blit on|off]  — per-capture label + blit log\n");
+        out.print("  smoothpan zoom [on|off|rate|anchor|filter|commit|test] — smooth zoom (3.24.0)\n");
+        out.print("  smoothpan compositor [on|off]          — retained-frame map compositor\n");
         out.print("Hotkeys: F7/F12=perf, F8=mouse, F9=dump, F10=classify, F11=probe\n");
         out.print("Shift mode: {}\n", shift_mode_name(g_shift_mode));
         out.print("Pan ffd policy: {}\n", ffd_policy_mode_name(ffd_policy_get_mode()));
@@ -750,7 +841,13 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
                   mouse_comp_effective_name(),
                   mouse_comp_sdl_enabled() ? "on" : "off",
                   mouse_comp_gps_enabled() ? "on" : "off");
-        out.print("Zoom: vanilla (smooth wheel zoom removed in 3.20.0)\n");
+        {
+            char buf[320];
+            zoom_camera_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+            compositor_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+        }
         out.print("Map clip: {} (gated=3.21.0 fix for vanilla-zoom black bands)\n",
                   smoothpan_legacy_clip() ? "legacy" : "gated");
         out.print("Capture label: '{}'  next seq: {}  blit log: {}\n",
@@ -774,14 +871,17 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
             is_enabled = true;
             g_camera.reset();
             zoom_probe_reset();
+            zoom_camera_reset();
+            compositor_reset();
             g_shift_mode = ShiftMode::Sdl;
             InitSDLHooks();
             renderer_hook_install();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).apply();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).apply();
             INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).apply();
-            out.print("SmoothPan {} enabled. WASD pan.\n", SMOOTHPAN_BUILD_VERSION);
+            out.print("SmoothPan {} enabled. WASD pan, wheel smooth zoom.\n", SMOOTHPAN_BUILD_VERSION);
             out.print("Mouse: gps (map clicks). F8 once if toolbar/UI feels wrong.\n");
+            out.print("Zoom: 'smoothpan zoom off' for vanilla wheel; 'smoothpan compositor off' for the 3.23 direct path.\n");
         }
         mouse_comp_boot_gps();
     } else if (is_enabled) {

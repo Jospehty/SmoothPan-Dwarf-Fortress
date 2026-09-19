@@ -61,6 +61,9 @@ struct SmoothCamera {
     int last_zoom = 0;
     int last_vel_sign_x = 0;
     int last_vel_sign_y = 0;
+    // Set by update() when something other than SmoothPan moved window_x/y
+    // since the previous tick (vanilla recentre on zoom, scripts, ...).
+    bool external_window_move = false;
 
     FrameSnapshot last_snapshot;
 
