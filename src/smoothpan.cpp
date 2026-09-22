@@ -16,10 +16,8 @@
 #include "df/gamest.h"
 #include "df/main_interface.h"
 
-#define NOMINMAX
-#include <windows.h>
-#undef min
-#undef max
+#include "platform.h"
+#include <cmath>
 #include "camera.h"
 #include "sdl_hook.h"
 #include "debug_paths.h"
@@ -36,6 +34,8 @@
 #include "zoom_probe.h"
 #include "zoom_camera.h"
 #include "compositor.h"
+#include "selftest.h"
+#include "DFHackVersion.h"
 #include <SDL.h>
 #include <cstdio>
 
@@ -43,6 +43,11 @@ using namespace DFHack;
 
 DFHACK_PLUGIN("smoothpan");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
+
+// Exported so scripts can identify a binary (grep SMOOTHPAN_BUILD=).
+extern "C" {
+DFhackDataExport const char* smoothpan_build_tag = SMOOTHPAN_BUILD_TAG;
+}
 
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
@@ -57,6 +62,11 @@ static void smoothpan_on_mouse_both_armed() {
 }
 
 static void smoothpan_poll_debug_hotkeys();
+
+static std::string g_dwarfmode_hook_report;
+void smoothpan_dwarfmode_hook_report(std::string& out) {
+    out += g_dwarfmode_hook_report.empty() ? "  dwarfmode interposes: not installed\n" : g_dwarfmode_hook_report;
+}
 
 static int g_saved_map_port_ppx = 0;
 static int g_saved_map_port_ppy = 0;
@@ -473,7 +483,13 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
                 perf_print_summary(Core::getInstance().getConsole());
                 perf_clear_capture_finished();
             }
+            {
+                std::string summary;
+                if (selftest_take_finished(summary))
+                    Core::getInstance().getConsole().print("{}", summary);
+            }
             g_camera.update();
+            selftest_tick();
             // Smooth zoom: ease the visual cell, request/land ladder commits
             // (moves true_x/y for anchor invariance) — before the frac freeze.
             zoom_camera_update(this);
@@ -540,12 +556,12 @@ static void smoothpan_poll_debug_hotkeys() {
     static bool f12_was_down = false;
     static bool f7_was_down = false;
 
-    bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    bool f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-    bool f12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
-    bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    bool f8 = sp_key_down(SpKey::F8);
+    bool f9 = sp_key_down(SpKey::F9);
+    bool f10 = sp_key_down(SpKey::F10);
+    bool f11 = sp_key_down(SpKey::F11);
+    bool f12 = sp_key_down(SpKey::F12);
+    bool f7 = sp_key_down(SpKey::F7);
 
     if (f8 && !f8_was_down) {
         MouseCompMode prev = g_mouse_comp_mode;
@@ -591,6 +607,7 @@ static void smoothpan_poll_debug_hotkeys() {
 }
 
 command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &parameters) {
+    if (parameters.empty()) parameters.push_back("help");
     if (parameters.size() >= 2 && parameters[0] == "dump") {
         int frames = std::stoi(parameters[1]);
         int delay = (parameters.size() == 3) ? std::stoi(parameters[2]) : 150;
@@ -720,6 +737,30 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
             out.print("{}\n", buf);
             out.print("  smoothpan zoom on|off | rate <n> | anchor cursor|centre | filter linear|nearest | commit feed|direct | test in|out\n");
         }
+    } else if (parameters.size() >= 1 && parameters[0] == "diag") {
+        std::string rep;
+        smoothpan_write_diag(rep);
+        const std::string path = smoothpan_log_path("smoothpan_diag.txt");
+        if (FILE* f = fopen(path.c_str(), "w")) { fwrite(rep.data(), 1, rep.size(), f); fclose(f); }
+        out.print("{}", rep);
+        out.print("(written to {})\n", path);
+    } else if (parameters.size() >= 1 && parameters[0] == "selftest") {
+        const std::string sub = parameters.size() >= 2 ? parameters[1] : "start";
+        if (sub == "status") {
+            out.print("selftest: {}\n", selftest_status());
+        } else if (sub == "abort") {
+            selftest_abort("aborted by command");
+            out.print("selftest: {}\n", selftest_status());
+        } else {
+            std::string why;
+            if (selftest_start(why)) {
+                out.print("SmoothPan selftest started (~15 s). The game is paused during the test; keep the DF window\n"
+                          "visible on the fortress map and do not touch keyboard/mouse. Poll: 'smoothpan selftest status'.\n");
+            } else {
+                out.printerr("selftest not started: {}\n", why);
+                return CR_FAILURE;
+            }
+        }
     } else if (parameters.size() >= 1 && parameters[0] == "compositor") {
         const std::string sub = parameters.size() >= 2 ? parameters[1] : "status";
         if (sub == "on") {
@@ -831,6 +872,8 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         out.print("  smoothpan zoomcap [<label>] [blit on|off]  — per-capture label + blit log\n");
         out.print("  smoothpan zoom [on|off|rate|anchor|filter|commit|test] — smooth zoom (3.24.0)\n");
         out.print("  smoothpan compositor [on|off]          — retained-frame map compositor\n");
+        out.print("  smoothpan diag                         — environment/hook report -> smoothpan_diag.txt\n");
+        out.print("  smoothpan selftest [status|abort]      — scripted zoom/pan/parity test -> smoothpan_selftest.txt\n");
         out.print("Hotkeys: F7/F12=perf, F8=mouse, F9=dump, F10=classify, F11=probe\n");
         out.print("Shift mode: {}\n", shift_mode_name(g_shift_mode));
         out.print("Pan ffd policy: {}\n", ffd_policy_mode_name(ffd_policy_get_mode()));
@@ -874,18 +917,33 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
             zoom_camera_reset();
             compositor_reset();
             g_shift_mode = ShiftMode::Sdl;
-            InitSDLHooks();
-            renderer_hook_install();
-            INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).apply();
-            INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).apply();
-            INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).apply();
-            out.print("SmoothPan {} enabled. WASD pan, wheel smooth zoom.\n", SMOOTHPAN_BUILD_VERSION);
+            const bool sdl_ok = InitSDLHooks();
+            const bool r2d_ok = renderer_hook_install();
+            g_dwarfmode_hook_report.clear();
+            auto note = [](const char* name, bool applied) {
+                g_dwarfmode_hook_report += "  viewscreen_dwarfmodest::";
+                g_dwarfmode_hook_report += name;
+                g_dwarfmode_hook_report += applied ? " = applied\n" : " = FAILED\n";
+                return applied;
+            };
+            bool dm_ok = note("feed", INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).apply());
+            dm_ok = note("logic", INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).apply()) && dm_ok;
+            dm_ok = note("render", INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).apply()) && dm_ok;
+            out.print("SmoothPan {} enabled ({}, DFHack {}). WASD pan, wheel smooth zoom.\n",
+                      SMOOTHPAN_BUILD_VERSION, sp_platform_name(), DFHack::Version::dfhack_version());
             out.print("Mouse: gps (map clicks). F8 once if toolbar/UI feels wrong.\n");
             out.print("Zoom: 'smoothpan zoom off' for vanilla wheel; 'smoothpan compositor off' for the 3.23 direct path.\n");
+            const int rc_sites = sp_hook_sites("SDL_RenderCopy") + sp_hook_sites("SDL_RenderCopyF");
+            if (!sdl_ok || rc_sites == 0 || !sp_hook_sites("SDL_RenderPresent"))
+                out.printerr("SmoothPan WARNING: SDL hooks incomplete (RenderCopy sites={}, RenderPresent sites={}). Run 'smoothpan diag'.\n",
+                             rc_sites, sp_hook_sites("SDL_RenderPresent"));
+            if (!r2d_ok || !dm_ok)
+                out.printerr("SmoothPan WARNING: some vtable interposes failed. Run 'smoothpan diag'.\n");
         }
         mouse_comp_boot_gps();
     } else if (is_enabled) {
         is_enabled = false;
+        selftest_abort("plugin disabled");
         restore_map_port_shift();
         g_camera.end_render_overscan();
         renderer_hook_remove();

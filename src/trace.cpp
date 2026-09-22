@@ -53,7 +53,7 @@ static bool trace_detail() {
     return g_trace_frame_index <= g_trace_detail_frames;
 }
 
-static void trace_logf(const char* fmt, ...) {
+[[maybe_unused]] static void trace_logf(const char* fmt, ...) {
     if (!g_trace_file || !trace_is_active()) return;
     va_list args;
     va_start(args, fmt);

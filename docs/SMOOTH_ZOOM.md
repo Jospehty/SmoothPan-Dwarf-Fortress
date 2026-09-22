@@ -1,6 +1,6 @@
 # Smooth Zoom (3.24.0) — retained-frame compositor + eased zoom camera
 
-**Status:** implemented in 3.24.0, **awaiting first in-game test**. This document
+**Status:** implemented in 3.24.0; 3.25.0 adds the Linux port plus `smoothpan diag` / `smoothpan selftest` (automated checks, see [LINUX_TESTING.md](LINUX_TESTING.md)). **Awaiting first in-game test.** This document
 is the single source of truth for how smooth zoom works now. Everything that came
 before (3.12 → 3.23.x: per-blit scaling attempts, dim/dispx hacks, the postmortem,
 the master plan) is in `docs/archive/` for history only — do not build on it.
@@ -116,7 +116,12 @@ The compositor **disables itself** (console message + reason in
 creation fails, or DF is found to use a non-1 render scale. Pan is unaffected in
 every fallback.
 
-## 6. First test protocol (3.24.0)
+## 6. First test protocol
+
+On either platform, `smoothpan selftest` runs an automated version of steps
+1, 3 and 4 below (parity, vanilla-zoom bridge, smooth zoom in/out, pan) and
+writes a verdict + per-frame table to `smoothpan_selftest.txt` with
+screenshots. On Linux, follow [LINUX_TESTING.md](LINUX_TESTING.md).
 
 Deploy (`deploy.ps1`), then in DFHack:
 

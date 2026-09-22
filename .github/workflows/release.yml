@@ -1,0 +1,209 @@
+name: Build and release
+
+# Builds smoothpan against a DFHack release tag on Linux (ubuntu-22.04 / gcc-11,
+# the same toolchain DFHack ships with) and Windows (windows-2022 / MSVC), then
+# publishes two GitHub releases: <version>-linux and <version>-windows.
+#
+#   push to main           -> build both, upload workflow artifacts (no release)
+#   push tag v*            -> build both + publish <tag>-linux / <tag>-windows
+#   workflow_dispatch      -> build both; publish when "publish" is true
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      dfhack_ref:
+        description: DFHack tag to build against
+        default: '53.16-r1.1'
+      version:
+        description: Release version (e.g. v1.3.0)
+        default: 'v1.3.0'
+      publish:
+        description: Publish GitHub releases
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  DFHACK_REF: ${{ inputs.dfhack_ref || '53.16-r1.1' }}
+
+jobs:
+  linux:
+    name: Linux (DFHack ${{ inputs.dfhack_ref || '53.16-r1.1' }})
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-11 g++-11 libxml-libxslt-perl libxml-libxml-perl zlib1g-dev
+      - name: Checkout SmoothPan
+        uses: actions/checkout@v4
+        with:
+          path: smoothpan
+      - name: Checkout DFHack
+        uses: actions/checkout@v4
+        with:
+          repository: DFHack/dfhack
+          ref: ${{ env.DFHACK_REF }}
+          submodules: true
+          path: dfhack
+      - name: Add plugin to DFHack tree
+        run: |
+          mkdir -p dfhack/plugins/external
+          cp -r smoothpan/src dfhack/plugins/external/smoothpan
+          echo 'add_subdirectory(smoothpan)' > dfhack/plugins/external/CMakeLists.txt
+      - name: Configure
+        env:
+          CC: gcc-11
+          CXX: g++-11
+        run: |
+          cmake -S dfhack -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LIBRARY=ON -DBUILD_PLUGINS=ON -DBUILD_TESTS=OFF -DBUILD_DOCS=OFF \
+            -DINSTALL_SCRIPTS=OFF -DINSTALL_DATA_FILES=OFF
+      - name: Build
+        run: ninja -C build smoothpan
+      - name: Package
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          case "$VER" in v*) ;; *) VER="dev-${GITHUB_SHA::7}" ;; esac
+          SO=build/plugins/external/smoothpan/smoothpan.plug.so
+          BUILD=$(grep -aoE 'SMOOTHPAN_BUILD=[0-9.]+' "$SO" | head -n1 | cut -d= -f2)
+          NAME="smoothpan-${VER}-linux-dfhack-${DFHACK_REF}"
+          D="dist/$NAME"
+          mkdir -p "$D/docs"
+          cp "$SO" "$D/"
+          cp -r smoothpan/src smoothpan/tools smoothpan/third_party "$D/"
+          cp smoothpan/docs/LINUX_TESTING.md smoothpan/docs/SMOOTH_ZOOM.md smoothpan/docs/ARCHITECTURE.md "$D/docs/"
+          GLIBC=$(objdump -T "$SO" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -n1)
+          cat > "$D/README.txt" <<EOF
+          SmoothPan ${BUILD} (${VER}) for Linux
+          Built against DFHack ${DFHACK_REF} (Dwarf Fortress ${DFHACK_REF%%-*}), gcc-11, requires ${GLIBC}.
+          Commit: ${GITHUB_SHA}
+
+          Install (checks the DFHack version first):
+              ./tools/linux/install.sh
+          If your DFHack is a different version, build it for yours instead:
+              ./tools/linux/build.sh --install-deps
+          Then in Dwarf Fortress (DFHack console):  enable smoothpan
+
+          Testing guide (written so an on-device Claude Code agent can run it):
+              docs/LINUX_TESTING.md
+          EOF
+          sed -i 's/^          //' "$D/README.txt"
+          echo "$DFHACK_REF" > "$D/BUILT_AGAINST.txt"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          echo "Built ${BUILD}, needs ${GLIBC}"
+          echo "LINUX_NAME=$NAME" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/${{ env.LINUX_NAME }}.tar.gz
+
+  windows:
+    name: Windows (DFHack ${{ inputs.dfhack_ref || '53.16-r1.1' }})
+    runs-on: windows-2022
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Python deps
+        run: pip install Jinja2
+      - name: Checkout SmoothPan
+        uses: actions/checkout@v4
+        with:
+          path: smoothpan
+      - name: Checkout DFHack
+        uses: actions/checkout@v4
+        with:
+          repository: DFHack/dfhack
+          ref: ${{ env.DFHACK_REF }}
+          submodules: true
+          path: dfhack
+      - name: Add plugin to DFHack tree
+        shell: bash
+        run: |
+          mkdir -p dfhack/plugins/external
+          cp -r smoothpan/src dfhack/plugins/external/smoothpan
+          cp -r smoothpan/third_party dfhack/plugins/external/third_party
+          echo 'add_subdirectory(smoothpan)' > dfhack/plugins/external/CMakeLists.txt
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        run: |
+          cmake -S dfhack -B build -GNinja -DDFHACK_BUILD_ARCH=64 -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_LIBRARY=ON -DBUILD_PLUGINS=ON -DBUILD_TESTS=OFF -DBUILD_DOCS=OFF `
+            -DINSTALL_SCRIPTS=OFF -DINSTALL_DATA_FILES=OFF
+      - name: Build
+        run: ninja -C build smoothpan
+      - name: Package
+        shell: bash
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          case "$VER" in v*) ;; *) VER="dev-${GITHUB_SHA::7}" ;; esac
+          DLL=build/plugins/external/smoothpan/smoothpan.plug.dll
+          BUILD=$(grep -aoE 'SMOOTHPAN_BUILD=[0-9.]+' "$DLL" | head -n1 | cut -d= -f2)
+          NAME="smoothpan-${VER}-windows-dfhack-${DFHACK_REF}"
+          D="dist/$NAME"
+          mkdir -p "$D/docs"
+          cp "$DLL" "$D/"
+          cp smoothpan/docs/SMOOTH_ZOOM.md smoothpan/docs/ARCHITECTURE.md "$D/docs/"
+          printf '%s\r\n' \
+            "SmoothPan ${BUILD} (${VER}) for Windows - UNTESTED build from CI" \
+            "Built against DFHack ${DFHACK_REF} with MSVC (windows-2022). Commit ${GITHUB_SHA}" \
+            "" \
+            "Install: copy smoothpan.plug.dll to <Dwarf Fortress>\\hack\\plugins\\" \
+            "Then in the DFHack console: enable smoothpan" \
+            "Your DFHack must be ${DFHACK_REF}; otherwise build from source with deploy.ps1." \
+            "Fallbacks: 'smoothpan zoom off' (vanilla wheel), 'smoothpan compositor off' (3.23 direct path)." \
+            "Diagnostics: 'smoothpan diag' and 'smoothpan selftest' (results in dfhack-config\\smoothpan\\)." \
+            > "$D/INSTALL.txt"
+          echo "$DFHACK_REF" > "$D/BUILT_AGAINST.txt"
+          (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
+          echo "WINDOWS_NAME=$NAME" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/${{ env.WINDOWS_NAME }}.zip
+
+  release:
+    name: Publish releases
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          LNX=$(ls artifacts/linux/*.tar.gz)
+          WIN=$(ls artifacts/windows/*.zip)
+          cat > linux-notes.md <<EOF
+          SmoothPan with smooth zoom (retained-frame compositor), **Linux port**. Built against **DFHack ${DFHACK_REF}**.
+
+          \`\`\`
+          tar xzf $(basename "$LNX")
+          cd $(basename "$LNX" .tar.gz)
+          ./tools/linux/install.sh          # checks your DFHack version, installs the plugin
+          # if it reports a version/glibc mismatch:
+          ./tools/linux/build.sh --install-deps
+          \`\`\`
+          In Dwarf Fortress: \`enable smoothpan\`. Testing guide: \`docs/LINUX_TESTING.md\` (agent-runnable: diag, selftest, collect).
+          EOF
+          cat > windows-notes.md <<EOF
+          SmoothPan with smooth zoom (retained-frame compositor) for **Windows — untested CI build** (MSVC, DFHack ${DFHACK_REF}).
+          Copy \`smoothpan.plug.dll\` into \`<Dwarf Fortress>\\hack\\plugins\\\` and run \`enable smoothpan\`.
+          EOF
+          sed -i 's/^          //' linux-notes.md windows-notes.md
+          gh release create "${VER}-linux" "$LNX" --target "$GITHUB_SHA" --prerelease \
+            --title "SmoothPan ${VER} — Linux" --notes-file linux-notes.md
+          gh release create "${VER}-windows" "$WIN" --target "$GITHUB_SHA" --prerelease \
+            --title "SmoothPan ${VER} — Windows (untested)" --notes-file windows-notes.md

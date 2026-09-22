@@ -16,13 +16,11 @@
 #include "sdl_fn.h"
 #include "compositor.h"
 #include "zoom_camera.h"
+#include "selftest.h"
 #include "VTableInterpose.h"
-#include "MinHook.h"
 #include <SDL.h>
 #include <cmath>
-#include <windows.h>
-#undef min
-#undef max
+#include "platform.h"
 #include "df/global_objects.h"
 #include "df/graphic.h"
 #include "df/graphic_map_portst.h"
@@ -635,17 +633,16 @@ static bool map_shift_gate_active() {
 }
 
 static bool process_map_blit(int src_x, int src_y, int src_w, int src_h, int x, int y, int w, int h, int* out_x, int* out_y) {
-    LARGE_INTEGER q0, q1, q_cls, freq;
+    uint64_t q0 = 0, q1 = 0, q_cls = 0;
     const bool time_it = perf_is_active();
     if (time_it) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&q0);
+        q0 = sp_perf_counter();
     }
 
     auto finish = [&](bool shifted, double classify_us) {
         if (time_it) {
-            QueryPerformanceCounter(&q1);
-            double total_us = (q1.QuadPart - q0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+            q1 = sp_perf_counter();
+            double total_us = sp_perf_us(q0, q1);
             perf_note_blit_hook(shifted, classify_us, total_us);
         }
     };
@@ -656,12 +653,12 @@ static bool process_map_blit(int src_x, int src_y, int src_w, int src_h, int x, 
     if (g_shift_mode == ShiftMode::SeqPreToolbar && !frame_seq_shift_allowed()) { finish(false, 0); return false; }
     if (!map_shift_gate_active()) { finish(false, 0); return false; }
 
-    if (time_it) QueryPerformanceCounter(&q_cls);
+    if (time_it) q_cls = sp_perf_counter();
     BlitClassification c = classify_blit(x, y, w, h);
     double classify_us = 0;
     if (time_it) {
-        QueryPerformanceCounter(&q1);
-        classify_us = (q1.QuadPart - q_cls.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+        q1 = sp_perf_counter();
+        classify_us = sp_perf_us(q_cls, q1);
     }
     g_last_blit_map_class = (c.cls == BlitClass::Map);
 
@@ -683,17 +680,16 @@ static bool process_map_blit(int src_x, int src_y, int src_w, int src_h, int x, 
 }
 
 static bool process_map_blit_f(float src_x, float src_y, float src_w, float src_h, float x, float y, float w, float h) {
-    LARGE_INTEGER q0, q1, q_cls, freq;
+    uint64_t q0 = 0, q1 = 0, q_cls = 0;
     const bool time_it = perf_is_active();
     if (time_it) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&q0);
+        q0 = sp_perf_counter();
     }
 
     auto finish = [&](bool shifted, double classify_us) {
         if (time_it) {
-            QueryPerformanceCounter(&q1);
-            double total_us = (q1.QuadPart - q0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+            q1 = sp_perf_counter();
+            double total_us = sp_perf_us(q0, q1);
             perf_note_blit_hook(shifted, classify_us, total_us);
         }
     };
@@ -708,12 +704,12 @@ static bool process_map_blit_f(float src_x, float src_y, float src_w, float src_
     int iy = static_cast<int>(std::floor(y));
     int iw = static_cast<int>(std::ceil(w));
     int ih = static_cast<int>(std::ceil(h));
-    if (time_it) QueryPerformanceCounter(&q_cls);
+    if (time_it) q_cls = sp_perf_counter();
     BlitClassification c = classify_blit(ix, iy, iw, ih);
     double classify_us = 0;
     if (time_it) {
-        QueryPerformanceCounter(&q1);
-        classify_us = (q1.QuadPart - q_cls.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+        q1 = sp_perf_counter();
+        classify_us = sp_perf_us(q_cls, q1);
     }
     g_last_blit_map_class = (c.cls == BlitClass::Map);
     bool shifted = should_shift_blit(c);
@@ -1081,6 +1077,8 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     // 3.24.0: finalize the retained-frame compositor for this frame (swap the
     // complete bake into the retained slot, restore DF's target if needed).
     if (is_enabled) compositor_on_present(renderer);
+    // Self-test measurements read back the finished frame (HUD included).
+    if (is_enabled) selftest_on_present(renderer);
 
     True_SDL_RenderPresent(renderer);
 }
@@ -1195,11 +1193,10 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
         g_telemetry_log += buf;
     }
 
-    LARGE_INTEGER edge_t0, edge_t1, edge_freq;
+    uint64_t edge_t0 = 0, edge_t1 = 0;
     const bool time_edge = perf_is_active();
     if (time_edge) {
-        QueryPerformanceFrequency(&edge_freq);
-        QueryPerformanceCounter(&edge_t0);
+        edge_t0 = sp_perf_counter();
     }
 
     if (extend_left) {
@@ -1253,8 +1250,8 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
     }
 
     if (time_edge) {
-        QueryPerformanceCounter(&edge_t1);
-        double us = (edge_t1.QuadPart - edge_t0.QuadPart) * 1e6 / static_cast<double>(edge_freq.QuadPart);
+        edge_t1 = sp_perf_counter();
+        double us = sp_perf_us(edge_t0, edge_t1);
         perf_note_edge_fill(us);
     }
 }
@@ -1328,49 +1325,36 @@ int Hook_SDL_RenderCopyExF(SDL_Renderer* renderer, SDL_Texture* texture, const S
 }
 
 bool InitSDLHooks() {
-    if (MH_Initialize() != MH_OK) return false;
+    // Platform hook layer: MinHook inline hooks on SDL2.dll (Windows) or GOT
+    // slot rewrites in DF's own modules (Linux).  See platform.cpp.
+    if (!sp_hooks_begin()) return false;
 
-    HMODULE sdl_module = GetModuleHandleA("SDL2.dll");
-    if (!sdl_module) return false;
+    GetRendererOutputSize_func = (SDL_GetRendererOutputSize_t)sp_sdl_sym("SDL_GetRendererOutputSize");
+    True_SDL_RenderReadPixels = (SDL_RenderReadPixels_t)sp_sdl_sym("SDL_RenderReadPixels");
+    True_SDL_SaveBMP_RW = (SDL_SaveBMP_RW_t)sp_sdl_sym("SDL_SaveBMP_RW");
+    True_SDL_CreateRGBSurfaceWithFormat = (SDL_CreateRGBSurfaceWithFormat_t)sp_sdl_sym("SDL_CreateRGBSurfaceWithFormat");
+    True_SDL_FreeSurface = (SDL_FreeSurface_t)sp_sdl_sym("SDL_FreeSurface");
+    True_SDL_RWFromFile = (SDL_RWFromFile_t)sp_sdl_sym("SDL_RWFromFile");
 
-    void* render_copy_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopy");
-    void* render_copy_ex_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyEx");
-    void* render_present_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderPresent");
-    void* get_mouse_state_addr = (void*)GetProcAddress(sdl_module, "SDL_GetMouseState");
-    void* get_global_mouse_state_addr = (void*)GetProcAddress(sdl_module, "SDL_GetGlobalMouseState");
-    void* render_set_clip_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderSetClipRect");
-    void* set_render_target_addr = (void*)GetProcAddress(sdl_module, "SDL_SetRenderTarget");
-    void* render_set_viewport_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderSetViewport");
+    sp_hook_add("SDL_RenderCopy", reinterpret_cast<void*>(&Hook_SDL_RenderCopy), reinterpret_cast<void**>(&True_SDL_RenderCopy));
+    sp_hook_add("SDL_RenderCopyEx", reinterpret_cast<void*>(&Hook_SDL_RenderCopyEx), reinterpret_cast<void**>(&True_SDL_RenderCopyEx));
+    sp_hook_add("SDL_RenderCopyF", reinterpret_cast<void*>(&Hook_SDL_RenderCopyF), reinterpret_cast<void**>(&True_SDL_RenderCopyF));
+    sp_hook_add("SDL_RenderCopyExF", reinterpret_cast<void*>(&Hook_SDL_RenderCopyExF), reinterpret_cast<void**>(&True_SDL_RenderCopyExF));
+    sp_hook_add("SDL_RenderFillRect", reinterpret_cast<void*>(&Hook_SDL_RenderFillRect), reinterpret_cast<void**>(&True_SDL_RenderFillRect));
+    sp_hook_add("SDL_RenderFillRectF", reinterpret_cast<void*>(&Hook_SDL_RenderFillRectF), reinterpret_cast<void**>(&True_SDL_RenderFillRectF));
+    sp_hook_add("SDL_RenderPresent", reinterpret_cast<void*>(&Hook_SDL_RenderPresent), reinterpret_cast<void**>(&True_SDL_RenderPresent));
+    sp_hook_add("SDL_GetMouseState", reinterpret_cast<void*>(&Hook_SDL_GetMouseState), reinterpret_cast<void**>(&GetMouseState_func));
+    sp_hook_add("SDL_GetGlobalMouseState", reinterpret_cast<void*>(&Hook_SDL_GetGlobalMouseState), reinterpret_cast<void**>(&GetGlobalMouseState_func));
+    sp_hook_add("SDL_RenderSetClipRect", reinterpret_cast<void*>(&Hook_SDL_RenderSetClipRect), reinterpret_cast<void**>(&True_SDL_RenderSetClipRect));
+    sp_hook_add("SDL_SetRenderTarget", reinterpret_cast<void*>(&Hook_SDL_SetRenderTarget), reinterpret_cast<void**>(&True_SDL_SetRenderTarget));
+    sp_hook_add("SDL_RenderSetViewport", reinterpret_cast<void*>(&Hook_SDL_RenderSetViewport), reinterpret_cast<void**>(&True_SDL_RenderSetViewport));
 
-    GetRendererOutputSize_func = (SDL_GetRendererOutputSize_t)GetProcAddress(sdl_module, "SDL_GetRendererOutputSize");
-    True_SDL_RenderReadPixels = (SDL_RenderReadPixels_t)GetProcAddress(sdl_module, "SDL_RenderReadPixels");
-    True_SDL_SaveBMP_RW = (SDL_SaveBMP_RW_t)GetProcAddress(sdl_module, "SDL_SaveBMP_RW");
-    True_SDL_CreateRGBSurfaceWithFormat = (SDL_CreateRGBSurfaceWithFormat_t)GetProcAddress(sdl_module, "SDL_CreateRGBSurfaceWithFormat");
-    True_SDL_FreeSurface = (SDL_FreeSurface_t)GetProcAddress(sdl_module, "SDL_FreeSurface");
-    True_SDL_RWFromFile = (SDL_RWFromFile_t)GetProcAddress(sdl_module, "SDL_RWFromFile");
-    True_SDL_RenderCopyF = (SDL_RenderCopyF_t)GetProcAddress(sdl_module, "SDL_RenderCopyF");
-    True_SDL_RenderCopyExF = (SDL_RenderCopyExF_t)GetProcAddress(sdl_module, "SDL_RenderCopyExF");
+    // Functions we call but do not hook: make sure a pointer exists even if
+    // the hook could not be created.
+    if (!True_SDL_RenderCopyF) True_SDL_RenderCopyF = (SDL_RenderCopyF_t)sp_sdl_sym("SDL_RenderCopyF");
+    if (!GetMouseState_func) GetMouseState_func = (SDL_GetMouseState_t)sp_sdl_sym("SDL_GetMouseState");
 
-    void* render_copy_f_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyF");
-    void* render_copy_ex_f_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderCopyExF");
-    void* render_fill_rect_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderFillRect");
-    void* render_fill_rect_f_addr = (void*)GetProcAddress(sdl_module, "SDL_RenderFillRectF");
-    if (render_fill_rect_addr) MH_CreateHook(render_fill_rect_addr, &Hook_SDL_RenderFillRect, reinterpret_cast<LPVOID*>(&True_SDL_RenderFillRect));
-    if (render_fill_rect_f_addr) MH_CreateHook(render_fill_rect_f_addr, &Hook_SDL_RenderFillRectF, reinterpret_cast<LPVOID*>(&True_SDL_RenderFillRectF));
-
-    if (render_copy_addr) MH_CreateHook(render_copy_addr, &Hook_SDL_RenderCopy, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopy));
-    if (render_copy_ex_addr) MH_CreateHook(render_copy_ex_addr, &Hook_SDL_RenderCopyEx, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopyEx));
-    if (render_copy_f_addr) MH_CreateHook(render_copy_f_addr, &Hook_SDL_RenderCopyF, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopyF));
-    if (render_copy_ex_f_addr) MH_CreateHook(render_copy_ex_f_addr, &Hook_SDL_RenderCopyExF, reinterpret_cast<LPVOID*>(&True_SDL_RenderCopyExF));
-    if (render_present_addr) MH_CreateHook(render_present_addr, &Hook_SDL_RenderPresent, reinterpret_cast<LPVOID*>(&True_SDL_RenderPresent));
-    if (get_mouse_state_addr) MH_CreateHook(get_mouse_state_addr, &Hook_SDL_GetMouseState, reinterpret_cast<LPVOID*>(&GetMouseState_func));
-    if (get_global_mouse_state_addr) MH_CreateHook(get_global_mouse_state_addr, &Hook_SDL_GetGlobalMouseState, reinterpret_cast<LPVOID*>(&GetGlobalMouseState_func));
-    if (render_set_clip_addr) MH_CreateHook(render_set_clip_addr, &Hook_SDL_RenderSetClipRect, reinterpret_cast<LPVOID*>(&True_SDL_RenderSetClipRect));
-    if (set_render_target_addr) MH_CreateHook(set_render_target_addr, &Hook_SDL_SetRenderTarget, reinterpret_cast<LPVOID*>(&True_SDL_SetRenderTarget));
-    if (render_set_viewport_addr) MH_CreateHook(render_set_viewport_addr, &Hook_SDL_RenderSetViewport, reinterpret_cast<LPVOID*>(&True_SDL_RenderSetViewport));
-
-    MH_EnableHook(MH_ALL_HOOKS);
-    return true;
+    return sp_hooks_commit();
 }
 
 bool smoothpan_raw_sdl_mouse(int* x, int* y) {
@@ -1380,6 +1364,5 @@ bool smoothpan_raw_sdl_mouse(int* x, int* y) {
 }
 
 void CleanupSDLHooks() {
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
+    sp_hooks_end();
 }

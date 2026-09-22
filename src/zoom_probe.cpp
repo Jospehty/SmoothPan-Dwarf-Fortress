@@ -83,7 +83,7 @@ void zoom_probe_reset() {
     g_set_viewport_calls = 0;
     g_event_pos = 0;
     std::memset(g_levels, 0, sizeof(g_levels));
-    std::memset(g_events, 0, sizeof(g_events));
+    for (auto& e : g_events) e = ZoomEvent{};
 }
 
 void zoom_probe_note_feed_zoom_in() {

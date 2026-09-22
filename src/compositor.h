@@ -70,6 +70,24 @@ bool compositor_post_blit(SDL_FRect* rect);
 void compositor_on_present(SDL_Renderer* r);
 
 // Diagnostics.
+struct CompositorFrameInfo {
+    bool started = false;      // a map layer was captured last frame
+    int choice = 0;            // 1 current bake, 2 retained bake (bridge), 3 forced current
+    bool complete = false;
+    bool narrow = false;
+    int passes = 0;
+    int late_passes = 0;
+    int map_blits = 0;
+    char end_by = '-';         // b blit, f fill, r render end, p present
+    float scale = 1.0f;
+    int cell = 0;
+    int vpw = 0;
+    int refw = 0;
+    int target_switches = 0;
+};
+// State of the frame that was just presented (valid after compositor_on_present).
+void compositor_last_frame(CompositorFrameInfo* out);
+const char* compositor_renderer_name();
 void compositor_write_f9(FILE* f);
 void compositor_status(char* buf, size_t n);
 // Reset transient state (plugin enable).  Textures are kept for reuse.

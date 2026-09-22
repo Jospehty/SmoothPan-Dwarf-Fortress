@@ -16,9 +16,7 @@
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
 
-#include <windows.h>
-#undef min
-#undef max
+#include "platform.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -138,6 +136,7 @@ constexpr int kMaxLogLines = 5000;
 
 static FILE* g_log = nullptr;
 static int g_log_lines = 0;
+static CompositorFrameInfo g_last_info;
 
 static void cplog(const char* fmt, ...) {
     if (g_log_lines >= kMaxLogLines) return;
@@ -167,23 +166,22 @@ static void disable(const char* reason) {
 
 static bool resolve_functions() {
     if (fn.resolved) return true;
-    HMODULE m = GetModuleHandleA("SDL2.dll");
-    if (!m) { disable("SDL2.dll not found"); return false; }
-    fn.CreateTexture = (SP_CreateTexture_t)GetProcAddress(m, "SDL_CreateTexture");
-    fn.DestroyTexture = (SP_DestroyTexture_t)GetProcAddress(m, "SDL_DestroyTexture");
-    fn.GetRenderTarget = (SP_GetRenderTarget_t)GetProcAddress(m, "SDL_GetRenderTarget");
-    fn.RenderClear = (SP_RenderClear_t)GetProcAddress(m, "SDL_RenderClear");
-    fn.SetRenderDrawColor = (SP_SetRenderDrawColor_t)GetProcAddress(m, "SDL_SetRenderDrawColor");
-    fn.GetRenderDrawColor = (SP_GetRenderDrawColor_t)GetProcAddress(m, "SDL_GetRenderDrawColor");
-    fn.SetTextureBlendMode = (SP_SetTextureBlendMode_t)GetProcAddress(m, "SDL_SetTextureBlendMode");
-    fn.SetTextureScaleMode = (SP_SetTextureScaleMode_t)GetProcAddress(m, "SDL_SetTextureScaleMode");
-    fn.GetRendererInfo = (SP_GetRendererInfo_t)GetProcAddress(m, "SDL_GetRendererInfo");
-    fn.RenderGetScale = (SP_RenderGetScale_t)GetProcAddress(m, "SDL_RenderGetScale");
-    fn.RenderGetViewport = (SP_RenderGetViewport_t)GetProcAddress(m, "SDL_RenderGetViewport");
-    fn.RenderGetClipRect = (SP_RenderGetClipRect_t)GetProcAddress(m, "SDL_RenderGetClipRect");
-    fn.RenderIsClipEnabled = (SP_RenderIsClipEnabled_t)GetProcAddress(m, "SDL_RenderIsClipEnabled");
-    fn.QueryTexture = (SP_QueryTexture_t)GetProcAddress(m, "SDL_QueryTexture");
-    fn.GetError = (SP_GetError_t)GetProcAddress(m, "SDL_GetError");
+    if (!sp_sdl_sym("SDL_CreateTexture")) { disable("SDL2 library not found"); return false; }
+    fn.CreateTexture = (SP_CreateTexture_t)sp_sdl_sym("SDL_CreateTexture");
+    fn.DestroyTexture = (SP_DestroyTexture_t)sp_sdl_sym("SDL_DestroyTexture");
+    fn.GetRenderTarget = (SP_GetRenderTarget_t)sp_sdl_sym("SDL_GetRenderTarget");
+    fn.RenderClear = (SP_RenderClear_t)sp_sdl_sym("SDL_RenderClear");
+    fn.SetRenderDrawColor = (SP_SetRenderDrawColor_t)sp_sdl_sym("SDL_SetRenderDrawColor");
+    fn.GetRenderDrawColor = (SP_GetRenderDrawColor_t)sp_sdl_sym("SDL_GetRenderDrawColor");
+    fn.SetTextureBlendMode = (SP_SetTextureBlendMode_t)sp_sdl_sym("SDL_SetTextureBlendMode");
+    fn.SetTextureScaleMode = (SP_SetTextureScaleMode_t)sp_sdl_sym("SDL_SetTextureScaleMode");
+    fn.GetRendererInfo = (SP_GetRendererInfo_t)sp_sdl_sym("SDL_GetRendererInfo");
+    fn.RenderGetScale = (SP_RenderGetScale_t)sp_sdl_sym("SDL_RenderGetScale");
+    fn.RenderGetViewport = (SP_RenderGetViewport_t)sp_sdl_sym("SDL_RenderGetViewport");
+    fn.RenderGetClipRect = (SP_RenderGetClipRect_t)sp_sdl_sym("SDL_RenderGetClipRect");
+    fn.RenderIsClipEnabled = (SP_RenderIsClipEnabled_t)sp_sdl_sym("SDL_RenderIsClipEnabled");
+    fn.QueryTexture = (SP_QueryTexture_t)sp_sdl_sym("SDL_QueryTexture");
+    fn.GetError = (SP_GetError_t)sp_sdl_sym("SDL_GetError");
 
     const bool ok = fn.CreateTexture && fn.DestroyTexture && fn.GetRenderTarget &&
                     fn.RenderClear && fn.SetRenderDrawColor && fn.GetRenderDrawColor &&
@@ -682,9 +680,23 @@ void compositor_on_present(SDL_Renderer* r) {
     }
     if (!g_frame_started) {
         g_frame_scale = 1.0f;
+        g_last_info = CompositorFrameInfo{};
         zoom_camera_on_present();
         return;
     }
+    g_last_info.started = true;
+    g_last_info.choice = g_frame_choice;
+    g_last_info.complete = g_frame_complete;
+    g_last_info.narrow = g_frame_narrow;
+    g_last_info.passes = g_frame_passes;
+    g_last_info.late_passes = g_frame_late_passes;
+    g_last_info.map_blits = g_frame_count_map;
+    g_last_info.end_by = g_frame_end_by;
+    g_last_info.scale = g_frame_scale;
+    g_last_info.cell = g_layers[g_cur].cell;
+    g_last_info.vpw = g_frame_vpw;
+    g_last_info.refw = g_frame_refw;
+    g_last_info.target_switches = g_frame_target_switches;
     Layer& cur = g_layers[g_cur];
     if (g_frame_choice == 1 || g_frame_choice == 3) {
         cur.valid = true;
@@ -719,6 +731,12 @@ void compositor_on_present(SDL_Renderer* r) {
     g_layer_done = false;
     zoom_camera_on_present();
 }
+
+void compositor_last_frame(CompositorFrameInfo* out) {
+    if (out) *out = g_last_info;
+}
+
+const char* compositor_renderer_name() { return g_renderer_name; }
 
 void compositor_write_f9(FILE* f) {
     if (!f) return;

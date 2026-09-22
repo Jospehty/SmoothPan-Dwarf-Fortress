@@ -1,9 +1,7 @@
 #define NOMINMAX
 #include "camera.h"
 #include <cmath>
-#include <windows.h>
-#undef min
-#undef max
+#include "platform.h"
 #include <algorithm>
 #include "df/global_objects.h"
 #include "df/world.h"
@@ -183,13 +181,17 @@ void SmoothCamera::reset() {
     last_snapshot = {};
 }
 
-static bool is_physical_up_held() { return (GetAsyncKeyState('W') & 0x8000) || (GetAsyncKeyState(VK_UP) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD8) & 0x8000); }
-static bool is_physical_down_held() { return (GetAsyncKeyState('S') & 0x8000) || (GetAsyncKeyState(VK_DOWN) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD2) & 0x8000); }
-static bool is_physical_left_held() { return (GetAsyncKeyState('A') & 0x8000) || (GetAsyncKeyState(VK_LEFT) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD4) & 0x8000); }
-static bool is_physical_right_held() { return (GetAsyncKeyState('D') & 0x8000) || (GetAsyncKeyState(VK_RIGHT) & 0x8000) || (GetAsyncKeyState(VK_NUMPAD6) & 0x8000); }
+// Self-test can hold virtual pan keys (see selftest.cpp).
+int g_sp_virtual_pan_x = 0;
+int g_sp_virtual_pan_y = 0;
+
+static bool is_physical_up_held() { return g_sp_virtual_pan_y < 0 || sp_key_down(SpKey::W) || sp_key_down(SpKey::Up) || sp_key_down(SpKey::Kp8); }
+static bool is_physical_down_held() { return g_sp_virtual_pan_y > 0 || sp_key_down(SpKey::S) || sp_key_down(SpKey::Down) || sp_key_down(SpKey::Kp2); }
+static bool is_physical_left_held() { return g_sp_virtual_pan_x < 0 || sp_key_down(SpKey::A) || sp_key_down(SpKey::Left) || sp_key_down(SpKey::Kp4); }
+static bool is_physical_right_held() { return g_sp_virtual_pan_x > 0 || sp_key_down(SpKey::D) || sp_key_down(SpKey::Right) || sp_key_down(SpKey::Kp6); }
 
 bool smoothpan_middle_mouse_button_held() {
-    return (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    return sp_mouse_middle_down();
 }
 
 bool smoothpan_middle_mouse_map_gate(int precise_x, int precise_y) {

@@ -66,7 +66,6 @@ static int g_cur_edge_fills = 0;
 static double g_cur_classify_us = 0;
 static double g_cur_edge_us = 0;
 static double g_cur_hook_us = 0;
-static bool g_cur_plugin_on = false;
 
 static std::vector<PerfFrame> g_history;
 static constexpr size_t kHistoryMax = 900;

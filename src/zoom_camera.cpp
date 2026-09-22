@@ -18,9 +18,6 @@
 #include "df/viewscreen.h"
 #include "df/interface_key.h"
 
-#include <windows.h>
-#undef min
-#undef max
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -483,6 +480,24 @@ bool zoom_camera_display_transform(float* s, float* ax, float* ay) {
     if (ax) *ax = g_display_ax;
     if (ay) *ay = g_display_ay;
     return true;
+}
+
+void zoom_camera_info(ZoomCameraInfo* o) {
+    if (!o) return;
+    o->enabled = g_enabled;
+    o->gesture = g_gesture;
+    o->pending = g_pending;
+    o->v = g_v;
+    o->target_cell = (g_target_idx >= 0 && g_target_idx < g_ladder_n) ? g_ladder[g_target_idx] : 0;
+    o->baked_cell = g_last_gps_z / 4;
+    o->desired_z = g_desired_z;
+    o->display_cell = g_display_cell;
+    o->display_scale = g_display_scale;
+    o->keys = g_keys;
+    o->commits = g_commits;
+    o->landed = g_landed;
+    o->external = g_external;
+    o->timeouts = g_timeouts;
 }
 
 void zoom_camera_write_f9(FILE* f) {

@@ -21,7 +21,11 @@ extern std::atomic<int> g_cur_pass_screen_x;
 extern std::atomic<int> g_cur_pass_screen_y;
 extern std::atomic<bool> g_cur_pass_is_map;
 
+#include <string>
+
 bool renderer_hook_install();
+// Per-interpose apply results (for smoothpan diag).
+void renderer_hook_report(std::string& out);
 void renderer_hook_remove();
 
 void renderer_log_start(int frames);

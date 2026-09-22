@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 using namespace DFHack;
 
@@ -321,14 +322,27 @@ IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, render);
 IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, zoom);
 IMPLEMENT_VMETHOD_INTERPOSE(smoothpan_renderer_2d_hook, set_viewport_zoom_factor);
 
+static std::string g_interpose_report;
+
 bool renderer_hook_install() {
     bool ok = true;
-    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_map_port).apply() && ok;
-    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_viewport).apply() && ok;
-    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, render).apply() && ok;
-    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, zoom).apply() && ok;
-    ok = INTERPOSE_HOOK(smoothpan_renderer_2d_hook, set_viewport_zoom_factor).apply() && ok;
+    g_interpose_report.clear();
+    auto note = [&](const char* name, bool applied) {
+        g_interpose_report += "  renderer_2d::";
+        g_interpose_report += name;
+        g_interpose_report += applied ? " = applied\n" : " = FAILED\n";
+        ok = applied && ok;
+    };
+    note("update_full_map_port", INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_map_port).apply());
+    note("update_full_viewport", INTERPOSE_HOOK(smoothpan_renderer_2d_hook, update_full_viewport).apply());
+    note("render", INTERPOSE_HOOK(smoothpan_renderer_2d_hook, render).apply());
+    note("zoom", INTERPOSE_HOOK(smoothpan_renderer_2d_hook, zoom).apply());
+    note("set_viewport_zoom_factor", INTERPOSE_HOOK(smoothpan_renderer_2d_hook, set_viewport_zoom_factor).apply());
     return ok;
+}
+
+void renderer_hook_report(std::string& out) {
+    out += g_interpose_report.empty() ? "  renderer_2d interposes: not installed\n" : g_interpose_report;
 }
 
 void renderer_hook_remove() {

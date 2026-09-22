@@ -2,7 +2,7 @@
 
 How SmoothPan implements smooth sub-tile panning in **Dwarf Fortress Premium** (DF 50.x) without modifying the game binary.
 
-**Version documented:** 3.24.0 (stable pan/MMB + retained-frame compositor + smooth zoom). Smooth zoom design and test protocol: [SMOOTH_ZOOM.md](SMOOTH_ZOOM.md).
+**Version documented:** 3.25.0 (stable pan/MMB + retained-frame compositor + smooth zoom). Smooth zoom design and test protocol: [SMOOTH_ZOOM.md](SMOOTH_ZOOM.md).
 
 ---
 
@@ -137,7 +137,20 @@ Interposes `df::renderer_2d`:
 
 **Clip snap:** Map-pass clip rect snapped to viewport bounds from `origin_x/y` so shifted tiles cannot paint into the left/top screen margin (fixes edge shimmer).
 
-### 3. SDL MinHook (`sdl_hook.cpp`)
+### Platform layer (`platform.cpp`, 3.25.0)
+
+All OS-specific code lives behind `platform.h`: timers, physical key/mouse state, SDL symbol lookup, and hook installation.
+
+| | Windows | Linux |
+|---|---|---|
+| SDL hooks | MinHook inline hooks on `SDL2.dll` exports (vendored `third_party/minhook`) | Rewrite the GOT slots (`JUMP_SLOT`/`GLOB_DAT` relocations) through which DF's own modules call SDL, found with `dl_iterate_phdr`; SDL itself and the plugin are never patched; originals restored on disable |
+| Real SDL functions | `GetProcAddress(SDL2.dll)` / MinHook trampolines | `dlsym` on the loaded `libSDL2-2.0.so` |
+| Keys / MMB | `GetAsyncKeyState` | `SDL_GetKeyboardState` / real `SDL_GetMouseState` (DF window must have focus) |
+| Timer | `QueryPerformanceCounter` | `clock_gettime(CLOCK_MONOTONIC)` |
+
+The GOT mechanism is verified by a standalone harness (executable + shared library calling libSDL2 with lazy binding, full RELRO, and `-fno-plt`). `smoothpan diag` lists patched call sites per function and module.
+
+### 3. SDL hooks (`sdl_hook.cpp`)
 
 | API | When active | Effect |
 |-----|-------------|--------|
@@ -285,6 +298,8 @@ All paths via `debug_paths.cpp` → `{dfhack-config}/smoothpan/`.
 | `perf.cpp` | F7 detailed FPS profiler |
 | `shift_mode.cpp` | A/B shift backend enum (SDL production path) |
 | `probe.cpp` / `trace.cpp` | Pipeline instrumentation |
+| `platform.cpp` | OS layer: hooks (MinHook / GOT), keys, timers, SDL symbols |
+| `selftest.cpp` | `smoothpan diag` and scripted `smoothpan selftest` |
 | `compositor.cpp` | Retained-frame map compositor (capture target, bridge, single composite) |
 | `zoom_camera.cpp` | Smooth zoom: eased visual cell, ladder commits, anchor invariance |
 | `zoom_probe.cpp` | Zoom event telemetry (F9) |
@@ -321,5 +336,5 @@ See [GOLDEN_PATH.md](GOLDEN_PATH.md) for the full anti-pattern list.
 ## Platform & scope
 
 - **Target:** DF Premium, `viewscreen_dwarfmodest` (fortress mode)
-- **OS:** Windows (key state via `GetAsyncKeyState`)
+- **OS:** Windows and Linux x86-64 (see Platform layer)
 - **DFHack:** Standard plugin; links against `dfhack.dll`, uses generated `df::` types

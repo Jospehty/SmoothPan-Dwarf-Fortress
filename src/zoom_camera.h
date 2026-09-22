@@ -68,5 +68,19 @@ bool zoom_camera_commit_direct();
 // Console: queue one vanilla ladder step (+1/-1) to be committed next frame.
 void zoom_camera_queue_test_step(int dir);
 
+struct ZoomCameraInfo {
+    bool enabled = false;
+    bool gesture = false;
+    bool pending = false;
+    float v = 0.0f;            // visual cell (px/tile)
+    int target_cell = 0;
+    int baked_cell = 0;        // gps->viewport_zoom_factor / 4 as last seen
+    int desired_z = 0;
+    int display_cell = 0;
+    float display_scale = 1.0f;
+    int keys = 0, commits = 0, landed = 0, external = 0, timeouts = 0;
+};
+void zoom_camera_info(ZoomCameraInfo* out);
+
 void zoom_camera_write_f9(FILE* f);
 void zoom_camera_status(char* buf, size_t n);

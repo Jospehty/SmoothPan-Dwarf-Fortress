@@ -31,7 +31,7 @@ if (-not (Test-Path $BuiltDll)) {
     throw "Build output not found: $BuiltDll"
 }
 
-$version =     "3.24.0"
+$version =     "3.25.0"
 $versionBytes = [System.Text.Encoding]::ASCII.GetBytes($version)
 $dllBytes = [IO.File]::ReadAllBytes($BuiltDll)
 $found = $false

@@ -6,7 +6,7 @@ The game continues to simulate on integer tile coordinates (`window_x` / `window
 
 **Latest release: [v1.2.0](releases/v1.2.0/)** (plugin build 3.14.1) — stable smooth pan foundation with integrated edge tile stretch (gap-free fast MMB/WASD).
 
-**In development: 3.24.0 — smooth zoom.** Wheel over the map glides in/out about the cursor (RimWorld-style), built on a retained-frame map compositor that also removes the black rebake bands of vanilla zoom. Design + test protocol: [docs/SMOOTH_ZOOM.md](docs/SMOOTH_ZOOM.md). Build from `src/` with `deploy.ps1`; `smoothpan zoom off` / `smoothpan compositor off` fall back to the 3.23 behaviour.
+**Testing: v1.3.0 (build 3.25.0) — smooth zoom + Linux.** Wheel over the map glides in/out about the cursor (RimWorld-style), built on a retained-frame map compositor that also removes the black rebake bands of vanilla zoom. Now builds for **Linux** as well as Windows. Releases are published by CI on the [Releases page](../../releases) as `v1.3.0-linux` and `v1.3.0-windows` (Windows build untested). Design: [docs/SMOOTH_ZOOM.md](docs/SMOOTH_ZOOM.md). Linux install + test guide: [docs/LINUX_TESTING.md](docs/LINUX_TESTING.md). `smoothpan zoom off` / `smoothpan compositor off` fall back to the 3.23 behaviour.
 
 Previous: [v1.1.0](releases/v1.1.0/) (3.11.52) · [v1.0.0](releases/v1.0.0/) (3.11.46)
 
@@ -135,11 +135,27 @@ Logs: `{DF folder}/dfhack-config/smoothpan/`
 
 ---
 
+## Install (Linux)
+
+Download `smoothpan-v1.3.0-linux-dfhack-<ver>.tar.gz` from the Releases page, then:
+
+```bash
+tar xzf smoothpan-*-linux-*.tar.gz && cd smoothpan-*-linux-*/
+./tools/linux/install.sh            # finds DF (Steam/Flatpak/DF_DIR), checks the DFHack version, installs
+./tools/linux/build.sh --install-deps   # only if install.sh reports a version or glibc mismatch
+```
+
+In game: `enable smoothpan` (or `./dfhack-run enable smoothpan` from the DF folder). Diagnostics: `smoothpan diag`, `smoothpan selftest`, `tools/linux/collect.sh`. Full guide: [docs/LINUX_TESTING.md](docs/LINUX_TESTING.md).
+
+---
+
 ## Building from source
 
 Only needed if you are developing SmoothPan or your DF/DFHack version has no pre-built release yet.
 
-Requirements: a full [DFHack](https://github.com/DFHack/dfhack) source tree, Visual Studio 2022, CMake.
+**Linux:** `tools/linux/build.sh` clones DFHack at the exact tag installed in your DF folder, builds the plugin, and installs it.
+
+**Windows:** requirements: a full [DFHack](https://github.com/DFHack/dfhack) source tree, Visual Studio 2022, CMake. MinHook is vendored in `third_party/minhook` (the build also accepts a `minhook/` folder next to the sources, as in older plugin trees).
 
 Copy or symlink this repo’s `src/` into `dfhack/plugins/smoothpan/` (or use the canonical layout in `src/CMakeLists.txt`), then:
 
@@ -167,6 +183,8 @@ powershell -ExecutionPolicy Bypass -File deploy.ps1
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | FFD policy, minimap throttling |
 | [docs/GOLDEN_PATH.md](docs/GOLDEN_PATH.md) | Target behavior and anti-patterns |
 | [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | F7/F9 tooling |
+| [docs/SMOOTH_ZOOM.md](docs/SMOOTH_ZOOM.md) | Smooth zoom: compositor + zoom camera design |
+| [docs/LINUX_TESTING.md](docs/LINUX_TESTING.md) | Linux install, diag/selftest, results collection |
 | [releases/README.md](releases/README.md) | Pre-built DLL index |
 
 ---
@@ -174,7 +192,7 @@ powershell -ExecutionPolicy Bypass -File deploy.ps1
 ## Known limitations
 
 - **Dwarf Fortress fortress mode only** — not adventure/legends
-- **Windows** — tested on Windows; Linux would need a port (key release uses `GetAsyncKeyState`)
+- **Windows + Linux (x86-64)** — Windows is the tested platform; the Linux port (3.25.0) is new and under test. On Linux, keys are read from SDL, so the DF window must have focus
 - **DFHack required** — plugin must match your DF + DFHack version; after a game update, wait for updated DFHack and a new SmoothPan release if the DLL stops loading
 - **Minimap** — may lag during pan in lazy mode; catches up when you stop
 - **Cliff / open-air views** — full z-rebake while panning (required for visual correctness)
