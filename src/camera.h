@@ -92,14 +92,25 @@ struct SmoothCamera {
 
 extern SmoothCamera g_camera;
 
-// Zoom-transition window (Stage 1, build 3.21.0+).
-// Set to a small frame count whenever gps->viewport_zoom_factor changes so the
-// SDL clip code can relax the origin-grid clip across vanilla's non-atomic
-// multi-frame rebake (the NARROW/WIDE alternation that caused black edge bands).
-// Decremented once per SDL_RenderPresent.  g_zoom_prev_z holds the z value we
-// were at before the most recent change (telemetry / future easing direction).
-extern std::atomic<int> g_zoom_transition_frames;
+// Zoom-transition window (Stage 1, build 3.21.0+; wall-clock since 3.25.1).
+// Opened whenever gps->viewport_zoom_factor changes so the SDL clip code can
+// relax the origin-grid clip across vanilla's non-atomic multi-frame rebake
+// (the NARROW/WIDE alternation that caused black edge bands).
+//
+// This used to be a count of 8 frames decremented once per SDL_RenderPresent,
+// which made the guard's real duration scale with the frame rate: 160 ms at
+// DF's default 50 fps cap but only ~44 ms at 180 fps.  Vanilla's rebake takes
+// a wall-clock amount of time, so above ~60 fps the window closed while the
+// rebake was still running, the clip was re-imposed mid-bake and starved map
+// blits, and compositor::count_ok() stopped guarding -- the black sections and
+// "notched" zoom players saw at high fps.  It is now a real deadline.
+extern std::atomic<long long> g_zoom_transition_until_us;
 extern std::atomic<int> g_zoom_prev_z;
+
+// True while the post-zoom rebake guard is open.
+bool zoom_transition_active();
+// Milliseconds left on that guard (0 when closed).  Telemetry only.
+int zoom_transition_remaining_ms();
 
 extern int g_sp_mmb_held;
 extern int g_sp_middle_drag;

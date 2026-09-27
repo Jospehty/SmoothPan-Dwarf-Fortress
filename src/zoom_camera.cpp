@@ -44,7 +44,14 @@ static bool g_min_learnt = false;
 static bool g_max_learnt = false;
 
 static bool g_enabled = true;
-static float g_rate = 16.0f;             // ease rate (1/s) in log-cell space
+// Ease rate (1/s) in log-cell space.  Was 16, which is a ~62 ms time constant
+// -- about 3x faster than the "~0.2 s per step" this was designed for, so the
+// glide was really a snap and the one-frame re-bake pop dominated it.  Measured
+// on the selftest frame table (worst-case normalised jerk of the visual cell,
+// across all four zoom steps): rate 16 -> 0.168, rate 8 -> 0.101, rate 5 ->
+// 0.163.  8 wins because it is the only one that also improves the multi-notch
+// step, and it keeps the magnification excursion moderate (1.58 vs 2.00 at 5).
+static float g_rate = 8.0f;
 static bool g_anchor_cursor = true;
 static bool g_commit_direct = false;     // false = inject vanilla ZOOM key; true = set_viewport_zoom_factor
 
@@ -52,8 +59,26 @@ static float g_v = 0.0f;                 // visual cell (px/tile), continuous
 static int g_target_idx = -1;            // ladder index the wheel is asking for
 static int g_desired_z = 0;              // z we have asked vanilla to bake (0 = none)
 static bool g_pending = false;           // commit requested, complete bake not yet displayed
-static int g_pending_frames = 0;
-static int g_inject_wait = 0;            // frames to wait before re-injecting a step
+static int g_pending_frames = 0;         // telemetry only; the timeout is wall-clock
+static long long g_pending_since_us = 0; // when the current commit was requested
+static long long g_inject_ready_us = 0;  // earliest time we may inject the next step
+
+// Both of these used to be frame counts (3 frames between injections, 15
+// frames to time a commit out).  Frame counts make the real interval scale
+// with the frame rate: 3 frames is 60 ms at DF's default 50 fps cap but only
+// 17 ms at 180 fps, so a fast multi-notch scroll fired its whole ladder of
+// commits into a handful of milliseconds -- vanilla rebaked continuously and
+// the ease never had time to run, which is the "completely notched and ugly"
+// zoom at high frame rates.  They are wall-clock now, set to what the old
+// counts gave at 50 fps.
+static constexpr int kInjectIntervalMs = 60;
+static constexpr int kCommitTimeoutMs = 300;
+
+static long long zc_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 static bool g_gesture = false;           // an ease toward target is in progress
 static float g_anchor_x = 0.0f, g_anchor_y = 0.0f;   // window px
 static bool g_anchor_valid = false;
@@ -199,7 +224,8 @@ static void external_resync(int cb, const char* why) {
     g_gesture = false;
     g_pending = false;
     g_pending_frames = 0;
-    g_inject_wait = 0;
+    g_pending_since_us = 0;
+    g_inject_ready_us = 0;
     g_desired_z = 0;
     g_anchor_valid = false;
     g_anchor_world_valid = false;
@@ -236,7 +262,8 @@ void zoom_camera_reset() {
     g_desired_z = 0;
     g_pending = false;
     g_pending_frames = 0;
-    g_inject_wait = 0;
+    g_pending_since_us = 0;
+    g_inject_ready_us = 0;
     g_gesture = false;
     g_anchor_valid = false;
     g_anchor_world_valid = false;
@@ -285,7 +312,15 @@ bool zoom_camera_on_zoom_key(int dir, bool over_map) {
             viewport_center(&g_anchor_x, &g_anchor_y);
         }
         g_anchor_valid = true;
-        zlog("gesture start anchor=(%.0f,%.0f) over_map=%d", g_anchor_x, g_anchor_y, over_map ? 1 : 0);
+        // Pin the world point under the anchor ONCE, here, for the whole
+        // gesture.  It used to be (re-)recorded at the start of every commit,
+        // so a multi-notch gesture re-derived it 2-3 times: any residual error
+        // left by the previous commit was re-recorded as the new truth and the
+        // next commit preserved *that*, compounding instead of correcting.
+        // One recording per gesture means every commit restores the same point.
+        record_anchor_world(cb);
+        zlog("gesture start anchor=(%.0f,%.0f) over_map=%d world=(%.2f,%.2f)",
+             g_anchor_x, g_anchor_y, over_map ? 1 : 0, g_anchor_world_x, g_anchor_world_y);
     }
     int ni = clamp_idx(g_target_idx + dir);
     if (ni != g_target_idx) {
@@ -330,12 +365,13 @@ void zoom_camera_update(df::viewscreen* vs) {
     }
 
     if (gps_z != g_last_gps_z) {
-        g_inject_wait = 0;
         if (g_pending && g_anchor_world_valid) {
             apply_anchor_invariance(cb);
             g_landed++;
             zlog("commit landed z %d -> %d (anchor kept)", g_last_gps_z, gps_z);
         } else {
+            // Someone else moved the zoom: nothing of ours to pace.
+            g_inject_ready_us = 0;
             g_external++;
             external_resync(cb, "external zoom change: resync");
         }
@@ -388,14 +424,17 @@ void zoom_camera_update(df::viewscreen* vs) {
 
     if (g_gesture && desired_z != gps_z) {
         if (!g_pending) {
-            record_anchor_world(cb);
+            // Only if the gesture did not already pin one (see on_zoom_key).
+            // Re-recording mid-gesture is what made multi-notch zoom drift.
+            if (!g_anchor_world_valid) record_anchor_world(cb);
             g_pending = true;
             g_pending_frames = 0;
+            g_pending_since_us = zc_now_us();
         }
         g_desired_z = desired_z;
-        if (g_inject_wait == 0) {
+        if (zc_now_us() >= g_inject_ready_us) {
             inject_step(vs, desired_z > gps_z ? +1 : -1, desired_z);
-            g_inject_wait = 3;
+            g_inject_ready_us = zc_now_us() + kInjectIntervalMs * 1000LL;
             // Vanilla applies the step synchronously inside feed: place the
             // camera now so even this frame's bake already honours the anchor.
             const int now_z = df::global::gps->viewport_zoom_factor;
@@ -404,7 +443,14 @@ void zoom_camera_update(df::viewscreen* vs) {
                 apply_anchor_invariance(now_z / 4);
                 g_last_gps_z = now_z;
                 g_landed++;
-                g_inject_wait = 0;
+                // Clear the gate: vanilla landed this one synchronously, so the
+                // next ladder step may follow immediately.  Holding the gate
+                // here (tried in 3.25.3) spaces commits by kInjectIntervalMs,
+                // which lets the ease stretch the *current* bake up to 2x
+                // before the new one lands -- a soft, magnified map that snaps
+                // crisp on the commit.  That reads as judder, so commit promptly
+                // and keep the composite scale near 1.
+                g_inject_ready_us = 0;
                 zlog("commit landed synchronously z %d -> %d (anchor kept)", gps_z, now_z);
             }
         }
@@ -412,7 +458,9 @@ void zoom_camera_update(df::viewscreen* vs) {
 
     if (g_pending) {
         g_pending_frames++;
-        if (g_pending_frames > 15) {
+        const long long elapsed_ms =
+            g_pending_since_us ? (zc_now_us() - g_pending_since_us) / 1000 : 0;
+        if (elapsed_ms > kCommitTimeoutMs) {
             // Vanilla did not deliver: learn the limit and fall back to the bake we have.
             if (g_desired_z > gps_z) { g_max_idx = ladder_nearest_index(static_cast<float>(cb)); g_max_learnt = true; }
             else if (g_desired_z < gps_z) { g_min_idx = ladder_nearest_index(static_cast<float>(cb)); g_min_learnt = true; }
@@ -420,7 +468,6 @@ void zoom_camera_update(df::viewscreen* vs) {
             external_resync(cb, "commit timeout: ladder limit learnt, resync");
         }
     }
-    if (g_inject_wait > 0) g_inject_wait--;
 
     if (g_gesture && !g_pending && gps_z == static_cast<int>(target_cell) * 4 &&
         std::fabs(g_v - target_cell) < 0.01f) {
@@ -502,12 +549,13 @@ void zoom_camera_info(ZoomCameraInfo* o) {
 
 void zoom_camera_write_f9(FILE* f) {
     if (!f) return;
-    fprintf(f, "  Zoom: enabled=%d gesture=%d v=%.2f target=%d cb=%d desired=%d pending=%d(%d) wait=%d "
+    fprintf(f, "  Zoom: enabled=%d gesture=%d v=%.2f target=%d cb=%d desired=%d pending=%d(%d) wait_ms=%d "
                "anchor=(%.0f,%.0f)%s display cell=%d s=%.3f keys=%d commits=%d landed=%d ext=%d timeouts=%d "
                "range=[%d..%d] last=%s\n",
             g_enabled ? 1 : 0, g_gesture ? 1 : 0, g_v,
             (g_target_idx >= 0 && g_target_idx < g_ladder_n) ? g_ladder[g_target_idx] : -1,
-            g_last_gps_z / 4, g_desired_z, g_pending ? 1 : 0, g_pending_frames, g_inject_wait,
+            g_last_gps_z / 4, g_desired_z, g_pending ? 1 : 0, g_pending_frames,
+            static_cast<int>(std::max(0LL, (g_inject_ready_us - zc_now_us()) / 1000)),
             g_frame_ax, g_frame_ay, g_anchor_valid ? "" : "(centre)",
             g_display_cell, g_display_scale, g_keys, g_commits, g_landed, g_external, g_timeouts,
             g_ladder[g_min_idx], g_ladder[g_max_idx], g_last_event);

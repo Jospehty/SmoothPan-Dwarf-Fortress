@@ -184,7 +184,7 @@ static void track_clip(const SDL_Rect* rect) {
 // edge bands).  During real panning with no zoom this is unchanged from before.
 static bool map_clip_should_constrain() {
     if (g_force_legacy_clip) return true;  // 3.20.0 behavior for A/B capture
-    if (g_zoom_transition_frames.load(std::memory_order_relaxed) > 0) return false;
+    if (zoom_transition_active()) return false;
     float sx = std::fabs(g_camera.render_shift_x());
     float sy = std::fabs(g_camera.render_shift_y());
     return sx >= 0.5f || sy >= 0.5f;
@@ -1006,10 +1006,10 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
                 // constrain=1 means the origin clip WAS imposed this frame.
                 // map_clipped_out>0 is direct evidence the clip discarded map
                 // blits (Problem A / black bands).
-                fprintf(f, "  ZoomDiag: gps_z=%d prev_z=%d ztrans=%d constrain=%d clip_set=%d shift=(%.2f,%.2f)\n",
+                fprintf(f, "  ZoomDiag: gps_z=%d prev_z=%d ztrans_ms=%d constrain=%d clip_set=%d shift=(%.2f,%.2f)\n",
                         df::global::gps ? df::global::gps->viewport_zoom_factor : 0,
                         g_zoom_prev_z.load(std::memory_order_relaxed),
-                        g_zoom_transition_frames.load(std::memory_order_relaxed),
+                        zoom_transition_remaining_ms(),
                         map_clip_should_constrain() ? 1 : 0,
                         g_active_clip_set ? 1 : 0,
                         g_camera.render_shift_x(), g_camera.render_shift_y());
@@ -1058,11 +1058,9 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     g_frame_ui_leak_shifted = 0;
     g_frame_map_clip_out = 0;
 
-    // Stage 1: count down the post-zoom transition window once per present.
-    {
-        int zt = g_zoom_transition_frames.load(std::memory_order_relaxed);
-        if (zt > 0) g_zoom_transition_frames.store(zt - 1, std::memory_order_relaxed);
-    }
+    // Stage 1: the post-zoom transition window is a wall-clock deadline now
+    // (see camera.h), so there is nothing to count down per present.  Counting
+    // frames made the guard 3.6x shorter at 180 fps than at 50 fps.
 
     g_camera.end_render_overscan();
 

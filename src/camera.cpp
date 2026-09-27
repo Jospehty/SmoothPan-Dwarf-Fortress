@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "camera.h"
 #include <cmath>
+#include <chrono>
 #include "platform.h"
 #include <algorithm>
 #include "df/global_objects.h"
@@ -158,9 +159,33 @@ void smoothpan_set_minimap_pan_mode(const char* mode) {
 SmoothCamera g_camera;
 
 // Zoom-transition window (Stage 1).  See camera.h.
-std::atomic<int> g_zoom_transition_frames{0};
+std::atomic<long long> g_zoom_transition_until_us{0};
 std::atomic<int> g_zoom_prev_z{0};
-static constexpr int kZoomTransitionFrames = 8;
+// Wall-clock length of the guard.  160 ms is what the old 8-frame count gave
+// at DF's default 50 fps cap -- the configuration that behaved best -- so this
+// keeps that behaviour and extends it to every frame rate.
+static constexpr int kZoomTransitionMs = 160;
+
+static long long steady_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+static void zoom_transition_open() {
+    g_zoom_transition_until_us.store(steady_now_us() + kZoomTransitionMs * 1000LL,
+                                     std::memory_order_relaxed);
+}
+
+bool zoom_transition_active() {
+    return steady_now_us() < g_zoom_transition_until_us.load(std::memory_order_relaxed);
+}
+
+int zoom_transition_remaining_ms() {
+    const long long d =
+        g_zoom_transition_until_us.load(std::memory_order_relaxed) - steady_now_us();
+    return d > 0 ? static_cast<int>(d / 1000) : 0;
+}
 
 void SmoothCamera::reset() {
     first_frame = true;
@@ -578,8 +603,7 @@ void SmoothCamera::update() {
                 // Open the transition window so the SDL clip relaxes across
                 // vanilla's multi-frame rebake (fixes black edge bands).
                 g_zoom_prev_z.store(last_zoom, std::memory_order_relaxed);
-                g_zoom_transition_frames.store(kZoomTransitionFrames,
-                                               std::memory_order_relaxed);
+                zoom_transition_open();
             }
             last_zoom = zoom;
         }

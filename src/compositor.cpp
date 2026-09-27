@@ -18,6 +18,7 @@
 
 #include "platform.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
@@ -121,7 +122,8 @@ static int g_frame_target_switches = 0;
 static char g_frame_end_by = '-';         // 'b' blit, 'f' fill, 'r' render end, 'p' present
 static float g_frame_scale = 1.0f;        // transform actually on screen
 static float g_frame_ax = 0.0f, g_frame_ay = 0.0f;   // logical coords
-static int g_bridge_streak = 0;
+static int g_bridge_streak = 0;           // telemetry; the cap itself is wall-clock
+static long long g_bridge_started_us = 0; // when the current bridge run began
 static int g_last_complete_count = 0;
 static int g_last_complete_cell = 0;
 static int g_last_complete_vpw = 0;
@@ -130,9 +132,26 @@ static int g_bridged_total = 0;
 static int g_forced_total = 0;
 static int g_composites_total = 0;
 
-constexpr int kMaxBridge = 4;             // consecutive frames we may show the retained bake
+// How long we may keep showing the retained bake while vanilla rebakes.  This
+// was 4 consecutive frames, which is 80 ms at DF's default 50 fps cap but only
+// ~22 ms at 180 fps -- far too short to cover a rebake, so the bridge gave up
+// and forced the incomplete frame on screen (choice=3) instead.  Wall-clock.
+constexpr int kMaxBridgeMs = 80;
 constexpr int kProbeFrames = 120;         // per-frame lines written to the log after enable
 constexpr int kMaxLogLines = 5000;
+
+static long long comp_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// May we still show the retained bake instead of this incomplete one?
+static bool bridge_budget_left() {
+    if (g_bridge_streak == 0) return true;   // first bridged frame of a run
+    if (g_bridge_started_us == 0) return true;
+    return (comp_now_us() - g_bridge_started_us) / 1000 < kMaxBridgeMs;
+}
 
 static FILE* g_log = nullptr;
 static int g_log_lines = 0;
@@ -328,7 +347,7 @@ static bool count_ok(int count, int cell) {
     // Outside a zoom transition the bake is trusted (count varies legitimately
     // with z-level / map edge).  Inside the window, guard against vanilla's
     // "wide viewport, zero blits" intermediate presents.
-    if (g_zoom_transition_frames.load(std::memory_order_relaxed) <= 0) return true;
+    if (!zoom_transition_active()) return true;
     if (g_last_complete_count <= 0 || g_last_complete_cell <= 0 || cell <= 0) return count > 0;
     double expected = static_cast<double>(g_last_complete_count) *
                       (static_cast<double>(g_last_complete_cell) * g_last_complete_cell) /
@@ -439,7 +458,7 @@ static void layer_end(SDL_Renderer* r, char by) {
     const Layer* show = &cur;
     int choice = 1;
     if (!complete) {
-        if (prev.valid && g_bridge_streak < kMaxBridge) { show = &prev; choice = 2; }
+        if (prev.valid && bridge_budget_left()) { show = &prev; choice = 2; }
         else { choice = 3; }
     }
     g_frame_choice = choice;
@@ -494,6 +513,7 @@ void compositor_reset() {
     g_frame_choice = 0;
     g_frame_scale = 1.0f;
     g_bridge_streak = 0;
+    g_bridge_started_us = 0;
     g_last_complete_count = 0;
     g_last_complete_cell = 0;
     g_last_complete_vpw = 0;
@@ -700,15 +720,17 @@ void compositor_on_present(SDL_Renderer* r) {
     Layer& cur = g_layers[g_cur];
     if (g_frame_choice == 1 || g_frame_choice == 3) {
         cur.valid = true;
-        if (g_frame_choice == 1 || g_bridge_streak >= kMaxBridge || g_last_complete_count == 0) {
+        if (g_frame_choice == 1 || !bridge_budget_left() || g_last_complete_count == 0) {
             g_last_complete_count = cur.count;
             g_last_complete_cell = cur.cell;
         }
         g_last_complete_vpw = cur.vpw;
         if (g_frame_choice == 3) g_forced_total++;
         g_bridge_streak = 0;
+        g_bridge_started_us = 0;
         g_cur = 1 - g_cur;     // this frame becomes the retained one
     } else {
+        if (g_bridge_streak == 0) g_bridge_started_us = comp_now_us();
         g_bridge_streak++;
         g_bridged_total++;
     }
