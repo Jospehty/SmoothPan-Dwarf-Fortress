@@ -296,9 +296,25 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             {
                 int rx = -1, ry = -1;
                 ViewportRect vp;
-                if (smoothpan_raw_sdl_mouse(&rx, &ry) && get_strict_viewport_rect(&vp))
+                // A test cursor override stands in for the real mouse so a
+                // scripted wheel event exercises this exact branch.
+                const bool have = zoom_camera_test_cursor(&rx, &ry) ||
+                                  smoothpan_raw_sdl_mouse(&rx, &ry);
+                if (have && get_strict_viewport_rect(&vp))
                     over_map = smoothpan_middle_mouse_map_gate(rx - vp.origin_x, ry - vp.origin_y);
             }
+            // Once a wheel gesture over the map is under way, keep it.  This
+            // test is re-run per wheel event from two live reads (the SDL
+            // mouse and a strict viewport rect), and during vanilla's rebake --
+            // exactly when a fast multi-notch scroll delivers its events --
+            // either can momentarily fail or return a transient viewport.  A
+            // single false reading hands that notch to vanilla, which zooms
+            // immediately; we then see gps_z move with nothing pending, call it
+            // an external change, and external_resync() snaps g_v to the new
+            // cell, destroying the ease.  That is the "fast scrolling reverts
+            // to jumping between zoom levels" symptom.  The gesture already has
+            // a pinned anchor, so continuing to own it is the correct call.
+            if (!over_map && zoom_camera_in_gesture()) over_map = true;
             if (over_map && zoom_camera_on_zoom_key(dir, over_map)) {
                 input->erase(df::interface_key::ZOOM_IN);
                 input->erase(df::interface_key::ZOOM_OUT);
@@ -708,6 +724,33 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         } else if (sub == "off") {
             zoom_camera_set_enabled(false);
             out.print("Smooth zoom: OFF (wheel = vanilla stepped zoom; compositor still bridges rebake frames).\n");
+        } else if (sub == "testcursor") {
+            // Stand in for the mouse so wheel events can be scripted through
+            // the real feed path: 'testcursor off', 'testcursor <x> <y>', or
+            // 'testcursor map' for a point a third into the map viewport.
+            if (parameters.size() >= 3 && parameters[2] == "off") {
+                zoom_camera_set_test_cursor(-1, -1);
+                out.print("Test cursor cleared; the real mouse is back in charge.\n");
+            } else if (parameters.size() >= 3 && parameters[2] == "map") {
+                ViewportRect vp;
+                if (get_strict_viewport_rect(&vp)) {
+                    const int ax = vp.left + (vp.right - vp.left) / 3;
+                    const int ay = vp.top + (vp.bottom - vp.top) / 3;
+                    zoom_camera_set_test_cursor(ax, ay);
+                    out.print("Test cursor at ({}, {}) inside map viewport.\n", ax, ay);
+                } else {
+                    out.print("No strict viewport available.\n");
+                }
+            } else if (parameters.size() >= 4) {
+                zoom_camera_set_test_cursor(std::stoi(parameters[2]), std::stoi(parameters[3]));
+                int x = 0, y = 0;
+                zoom_camera_test_cursor(&x, &y);
+                out.print("Test cursor at ({}, {}).\n", x, y);
+            } else {
+                int x = 0, y = 0;
+                if (zoom_camera_test_cursor(&x, &y)) out.print("Test cursor at ({}, {}).\n", x, y);
+                else out.print("No test cursor set.\n");
+            }
         } else if (sub == "rate" && parameters.size() >= 3) {
             zoom_camera_set_rate(static_cast<float>(std::stod(parameters[2])));
             out.print("Smooth zoom ease rate: {} /s (higher = snappier; 8..30 sensible).\n", zoom_camera_rate());

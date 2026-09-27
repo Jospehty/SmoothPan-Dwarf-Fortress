@@ -156,6 +156,12 @@ struct StepEnd {
     double world_cx = 0, world_cy = 0;
     bool valid = false;
     int cell = 0;
+    // Cell as it was when the step was entered, BEFORE its action ran.  The
+    // "did the zoom level actually change?" check cannot use the step's first
+    // sampled frame: vanilla lands these commits synchronously inside feed(),
+    // so by frame 0 the cell has already moved and cell_first == cell_last
+    // even though the zoom worked perfectly.
+    int cell_entry = 0;
 };
 
 // Threads: selftest_tick runs on DF's simulation/interface thread (viewscreen
@@ -198,15 +204,35 @@ static void set_pan(int x, int y) {
     if (y < 0) g_camera.panning_up = true;
 }
 
-static void world_centre(double* wx, double* wy, int* cell) {
+// World point currently shown under a given window pixel.
+static void world_at(double px, double py, double* wx, double* wy, int* cell) {
     ViewportRect vp;
     *wx = *wy = 0;
     *cell = 0;
     if (!get_strict_viewport_rect(&vp) || vp.cell_size <= 0) return;
-    const double cx = 0.5 * (vp.left + vp.right), cy = 0.5 * (vp.top + vp.bottom);
-    *wx = g_camera.true_x + (cx - vp.origin_x) / vp.cell_size;
-    *wy = g_camera.true_y + (cy - vp.origin_y) / vp.cell_size;
+    *wx = g_camera.true_x + (px - vp.origin_x) / vp.cell_size;
+    *wy = g_camera.true_y + (py - vp.origin_y) / vp.cell_size;
     *cell = vp.cell_size;
+}
+
+// Drift is measured at the ANCHOR the gesture used, not at the viewport
+// centre.  Anchoring at the centre and measuring at the centre is degenerate:
+// the metric is identically zero for any correct OR incorrect anchor, so it
+// could never detect an anchor bug.  Falls back to the centre only when no
+// gesture has run yet.
+static void world_at_anchor(double* wx, double* wy, int* cell) {
+    ViewportRect vp;
+    float ax = 0, ay = 0;
+    if (!zoom_camera_last_anchor_px(&ax, &ay)) {
+        if (!get_strict_viewport_rect(&vp) || vp.cell_size <= 0) {
+            *wx = *wy = 0;
+            *cell = 0;
+            return;
+        }
+        ax = 0.5f * (vp.left + vp.right);
+        ay = 0.5f * (vp.top + vp.bottom);
+    }
+    world_at(ax, ay, wx, wy, cell);
 }
 
 static void measure_gaps(SDL_Renderer* r, Rec& rec) {
@@ -281,15 +307,34 @@ static void parity_capture(SDL_Renderer* r, bool reference) {
 
 static void enter_step(int i) {
     const Step& s = kSteps[i];
+    {
+        ViewportRect vp;
+        if (get_strict_viewport_rect(&vp)) g_step_end[i].cell_entry = vp.cell_size;
+    }
     switch (s.act) {
-    case Act::Settle:
+    case Act::Settle: {
         compositor_set_enabled(true);
         zoom_camera_set_enabled(true);
+        // Start from a clean zoom state.  Learnt ladder limits and inserted
+        // rungs persist across gestures, so without this a test inherits
+        // whatever the player's own scrolling left behind and the steps no
+        // longer mean the same thing run to run.
+        zoom_camera_reset();
+        // Anchor the zoom steps well off-centre (a third in from the top-left
+        // of the map viewport).  An off-centre anchor is what makes the drift
+        // metric meaningful, and it is what a real player's cursor looks like.
+        ViewportRect vp;
+        if (get_strict_viewport_rect(&vp)) {
+            const int ax = vp.left + (vp.right - vp.left) / 3;
+            const int ay = vp.top + (vp.bottom - vp.top) / 3;
+            zoom_camera_set_test_cursor(ax, ay);
+        }
         break;
+    }
     case Act::CompOn: compositor_set_enabled(true); break;
     case Act::CompOff: compositor_set_enabled(false); break;
-    case Act::Away: zoom_camera_on_zoom_key(g_dir, false); break;
-    case Act::Back: zoom_camera_on_zoom_key(-g_dir, false); break;
+    case Act::Away: zoom_camera_on_zoom_key(g_dir, true); break;
+    case Act::Back: zoom_camera_on_zoom_key(-g_dir, true); break;
     case Act::VanAway:
         zoom_camera_set_enabled(false);
         zoom_camera_queue_test_step(g_dir);
@@ -473,8 +518,8 @@ void selftest_tick() {
     g_ticked_this_frame = true;
     const Step& s = kSteps[step];
     if (s.repeat_at >= 0 && g_frame.load() == s.repeat_at) {
-        if (s.act == Act::Away) zoom_camera_on_zoom_key(g_dir, false);
-        if (s.act == Act::Back) zoom_camera_on_zoom_key(-g_dir, false);
+        if (s.act == Act::Away) zoom_camera_on_zoom_key(g_dir, true);
+        if (s.act == Act::Back) zoom_camera_on_zoom_key(-g_dir, true);
     }
     switch (s.act) {
     case Act::PanA: set_pan(+1, 0); break;
@@ -523,7 +568,7 @@ void selftest_on_present(SDL_Renderer* r) {
 
     if (g_frame.load() + 1 >= s.frames) {
         StepEnd& e = g_step_end[g_step.load()];
-        world_centre(&e.world_cx, &e.world_cy, &e.cell);
+        world_at_anchor(&e.world_cx, &e.world_cy, &e.cell);
         e.valid = true;
         g_frame = 0;
         g_step_entered = false;
@@ -560,6 +605,7 @@ static void finish(const char* abort_reason) {
     g_running = false;
     set_pan(0, 0);
     g_sp_virtual_pan_x = g_sp_virtual_pan_y = 0;
+    zoom_camera_set_test_cursor(-1, -1);   // hand the real mouse back
     compositor_set_enabled(g_saved_comp);
     zoom_camera_set_enabled(g_saved_zoom);
     if (g_saved_pause_valid && df::global::pause_state) *df::global::pause_state = g_saved_pause;
@@ -678,12 +724,15 @@ static void finish(const char* abort_reason) {
         if (band > cell / 2) level = "FAIL";
         else if (band > 2) level = "WARN";
         if (s.act == Act::Away || s.act == Act::Back) {
-            if (cell_first == cell_last) level = "FAIL";          // zoom did not change the level
+            if (g_step_end[i].cell_entry > 0 && g_step_end[i].cell_entry == cell_last)
+                level = "FAIL";                                   // zoom did not change the level
             if (to1 - to0 > 0) level = "FAIL";
             if (smax < 1.001f && strcmp(level, "FAIL")) level = "WARN";   // no visible easing
             if (drift > 0.75) level = "FAIL";
         }
-        if ((s.act == Act::VanAway || s.act == Act::VanBack) && cell_first == cell_last) level = "FAIL";
+        if ((s.act == Act::VanAway || s.act == Act::VanBack) &&
+            g_step_end[i].cell_entry > 0 && g_step_end[i].cell_entry == cell_last)
+            level = "FAIL";
         if (notcap > n / 10 && i != 2) level = "FAIL";
         line(level, b);
     }

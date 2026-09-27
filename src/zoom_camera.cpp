@@ -82,6 +82,16 @@ static long long zc_now_us() {
 static bool g_gesture = false;           // an ease toward target is in progress
 static float g_anchor_x = 0.0f, g_anchor_y = 0.0f;   // window px
 static bool g_anchor_valid = false;
+// The anchor the last gesture actually used, kept after the gesture ends so a
+// test can ask "did the world point under the anchor stay put?".  Measuring
+// drift at the viewport centre while also anchoring there is degenerate -- it
+// cannot detect an anchor error at all.
+static float g_last_anchor_x = 0.0f, g_last_anchor_y = 0.0f;
+static bool g_last_anchor_valid = false;
+// Test-only cursor override.  >= 0 means on_zoom_key uses this instead of the
+// real SDL mouse, so the selftest can exercise the true cursor-anchored path
+// (over_map = true) rather than falling back to the centre.
+static int g_test_cursor_x = -1, g_test_cursor_y = -1;
 static double g_anchor_world_x = 0.0, g_anchor_world_y = 0.0;
 static bool g_anchor_world_valid = false;
 
@@ -282,6 +292,34 @@ void zoom_camera_reset() {
 
 void zoom_camera_set_enabled(bool enabled) { g_enabled = enabled; }
 bool zoom_camera_enabled() { return g_enabled; }
+void zoom_camera_set_test_cursor(int x, int y) {
+    g_test_cursor_x = x;
+    g_test_cursor_y = y;
+    // Seed the "last anchor" too, so measurements taken BEFORE the first
+    // gesture (the idle steps) use the same anchor the zoom steps will.
+    // Otherwise they fall back to the viewport centre and the first zoom step
+    // shows a huge bogus drift that is only the change of reference point.
+    if (x >= 0) {
+        g_last_anchor_x = static_cast<float>(x);
+        g_last_anchor_y = static_cast<float>(y);
+        g_last_anchor_valid = true;
+    }
+}
+
+bool zoom_camera_test_cursor(int* x, int* y) {
+    if (g_test_cursor_x < 0) return false;
+    if (x) *x = g_test_cursor_x;
+    if (y) *y = g_test_cursor_y;
+    return true;
+}
+
+bool zoom_camera_last_anchor_px(float* x, float* y) {
+    if (!g_last_anchor_valid) return false;
+    if (x) *x = g_last_anchor_x;
+    if (y) *y = g_last_anchor_y;
+    return true;
+}
+
 void zoom_camera_set_rate(float per_second) { g_rate = std::max(2.0f, std::min(60.0f, per_second)); }
 float zoom_camera_rate() { return g_rate; }
 void zoom_camera_set_anchor_cursor(bool cursor) { g_anchor_cursor = cursor; }
@@ -304,7 +342,15 @@ bool zoom_camera_on_zoom_key(int dir, bool over_map) {
         ViewportRect vp;
         int rx = -1, ry = -1;
         bool ok = get_strict_viewport_rect(&vp);
-        if (g_anchor_cursor && over_map && ok && smoothpan_raw_sdl_mouse(&rx, &ry) &&
+        bool have_mouse;
+        if (g_test_cursor_x >= 0) {
+            rx = g_test_cursor_x;
+            ry = g_test_cursor_y;
+            have_mouse = true;
+        } else {
+            have_mouse = smoothpan_raw_sdl_mouse(&rx, &ry);
+        }
+        if (g_anchor_cursor && over_map && ok && have_mouse &&
             rx >= vp.left && rx < vp.right && ry >= vp.top && ry < vp.bottom) {
             g_anchor_x = static_cast<float>(rx);
             g_anchor_y = static_cast<float>(ry);
@@ -312,6 +358,9 @@ bool zoom_camera_on_zoom_key(int dir, bool over_map) {
             viewport_center(&g_anchor_x, &g_anchor_y);
         }
         g_anchor_valid = true;
+        g_last_anchor_x = g_anchor_x;
+        g_last_anchor_y = g_anchor_y;
+        g_last_anchor_valid = true;
         // Pin the world point under the anchor ONCE, here, for the whole
         // gesture.  It used to be (re-)recorded at the start of every commit,
         // so a multi-notch gesture re-derived it 2-3 times: any residual error

@@ -84,3 +84,15 @@ void zoom_camera_info(ZoomCameraInfo* out);
 
 void zoom_camera_write_f9(FILE* f);
 void zoom_camera_status(char* buf, size_t n);
+
+// Test support.  set_test_cursor(-1, -1) clears the override and returns the
+// real SDL mouse to duty; any other value makes on_zoom_key anchor there, so a
+// test can drive the true cursor-anchored path.  last_anchor_px reports the
+// anchor the most recent gesture used (it survives the gesture ending) so a
+// test can measure drift AT the anchor rather than at the viewport centre.
+void zoom_camera_set_test_cursor(int x, int y);
+bool zoom_camera_last_anchor_px(float* x, float* y);
+// Returns true (and fills x/y) while a test cursor override is in force.  The
+// feed hook consults this so a scripted wheel event takes the same over_map
+// branch a real cursor would.
+bool zoom_camera_test_cursor(int* x, int* y);
