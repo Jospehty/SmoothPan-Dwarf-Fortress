@@ -131,6 +131,13 @@ static int g_frames_seen = 0;
 static int g_bridged_total = 0;
 static int g_forced_total = 0;
 static int g_composites_total = 0;
+// Render-target leak guard (see compositor_guard_present).
+static int g_target_leaks = 0;
+static int g_test_leak_left = 0;
+static long long g_leak_window_start_us = 0;
+static int g_leaks_in_window = 0;
+constexpr int kLeakWindowMs = 2000;
+constexpr int kLeaksToDisable = 3;
 
 // How long we may keep showing the retained bake while vanilla rebakes.  This
 // was 4 consecutive frames, which is 80 ms at DF's default 50 fps cap but only
@@ -173,8 +180,14 @@ static void cplog(const char* fmt, ...) {
     g_log_lines++;
 }
 
+static void fail_frame(SDL_Renderer* r, const char* why);
+
 static void disable(const char* reason) {
     if (g_state == CompositorState::Disabled) return;
+    // Never leave DF drawing into our texture: if a capture is open, hand the
+    // target back before we stop managing it.  (Previously the state flipped
+    // and the capture was simply abandoned with our texture still bound.)
+    if (g_capturing && g_renderer) fail_frame(g_renderer, "compositor disabled mid-capture");
     g_state = CompositorState::Disabled;
     snprintf(g_disable_reason, sizeof(g_disable_reason), "%s", reason ? reason : "?");
     cplog("DISABLED: %s", g_disable_reason);
@@ -522,6 +535,9 @@ void compositor_reset() {
     g_bridged_total = 0;
     g_forced_total = 0;
     g_composites_total = 0;
+    g_target_leaks = 0;
+    g_leak_window_start_us = 0;
+    g_leaks_in_window = 0;
     for (int i = 0; i < 2; ++i) g_layers[i].valid = false;
     if (g_state == CompositorState::Disabled) {
         // Fresh enable: give the compositor another chance.
@@ -754,6 +770,44 @@ void compositor_on_present(SDL_Renderer* r) {
     zoom_camera_on_present();
 }
 
+void compositor_guard_present(SDL_Renderer* r) {
+    if (!r) return;
+    if (g_test_leak_left > 0 && g_layers[g_cur].tex) {
+        g_test_leak_left--;
+        True_SDL_SetRenderTarget(r, g_layers[g_cur].tex);   // simulated leak
+    }
+    // 1. A capture still open at present (plugin disabled mid-frame, or a
+    //    layer end that never fired).  When enabled, compositor_on_present has
+    //    already closed it; when disabled nothing else ever will.
+    if (g_capturing) fail_frame(r, "capture still open at present");
+    // 2. Whatever the cause, never present with our texture as the target.
+    if (!fn.GetRenderTarget) return;   // compositor never initialised: nothing of ours to leak
+    SDL_Texture* t = fn.GetRenderTarget(r);
+    if (!t || (t != g_layers[0].tex && t != g_layers[1].tex)) return;
+
+    True_SDL_SetRenderTarget(r, g_df_target);
+    g_bound_ours = false;
+    g_target_leaks++;
+    const long long now = comp_now_us();
+    if (g_leak_window_start_us == 0 || (now - g_leak_window_start_us) / 1000 > kLeakWindowMs) {
+        g_leak_window_start_us = now;
+        g_leaks_in_window = 0;
+    }
+    g_leaks_in_window++;
+    cplog("TARGET LEAK repaired at present: our layer %p was bound (df_target=%p logical=%p) "
+          "leaks=%d in_window=%d choice=%d end=%c passes=%d/%d late=%d",
+          static_cast<void*>(t), static_cast<void*>(g_df_target), static_cast<void*>(g_df_logical),
+          g_target_leaks, g_leaks_in_window, g_frame_choice, g_frame_end_by,
+          g_frame_passes, g_passes_expected, g_frame_late_passes);
+    if (g_leaks_in_window >= kLeaksToDisable)
+        disable("render target leaked at present repeatedly (strobe guard)");
+}
+
+int compositor_target_leaks() { return g_target_leaks; }
+
+void compositor_emergency_disable(const char* reason) { disable(reason); }
+void compositor_test_leak(int n) { g_test_leak_left = n; }
+
 void compositor_last_frame(CompositorFrameInfo* out) {
     if (out) *out = g_last_info;
 }
@@ -779,10 +833,10 @@ void compositor_write_f9(FILE* f) {
 
 void compositor_status(char* buf, size_t n) {
     if (!buf || n == 0) return;
-    snprintf(buf, n, "compositor=%s%s%s (renderer=%s, %dx%d, frames=%d, composites=%d, bridged=%d, forced=%d, passes/frame=%d, filter=%s)",
+    snprintf(buf, n, "compositor=%s%s%s (renderer=%s, %dx%d, frames=%d, composites=%d, bridged=%d, forced=%d, leaks=%d, passes/frame=%d, filter=%s)",
              g_user_enabled ? compositor_state_name() : "off",
              g_disable_reason[0] ? " reason=" : "", g_disable_reason,
              g_renderer_name, g_target_w, g_target_h, g_frames_seen, g_composites_total,
-             g_bridged_total, g_forced_total, g_passes_expected,
+             g_bridged_total, g_forced_total, g_target_leaks, g_passes_expected,
              g_filter_linear ? "linear" : "nearest");
 }

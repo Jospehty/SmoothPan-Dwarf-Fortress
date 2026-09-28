@@ -20,6 +20,7 @@
 #include <cmath>
 #include "camera.h"
 #include "sdl_hook.h"
+#include "frame_probe.h"
 #include "debug_paths.h"
 #include "viewport.h"
 #include "version.h"
@@ -804,6 +805,26 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
                 return CR_FAILURE;
             }
         }
+    } else if (parameters.size() >= 1 && parameters[0] == "watch") {
+        // Pixel-truth probe: 'watch' status, 'watch on|off' (strobe watchdog),
+        // 'watch record <frames> [label]' (per-frame log to smoothpan_watch.txt).
+        const std::string sub = parameters.size() >= 2 ? parameters[1] : "status";
+        if (sub == "on" || sub == "off") {
+            frame_probe_set_watchdog(sub == "on");
+            out.print("Strobe watchdog: {}.\n", sub);
+        } else if (sub == "teststrobe") {
+            frame_probe_test_strobe(12);
+            out.print("Feeding the watchdog 12 synthetic alternating samples (nothing changes on screen).\n");
+        } else if (sub == "record" && parameters.size() >= 3) {
+            const int n = std::stoi(parameters[2]);
+            const std::string label = parameters.size() >= 4 ? parameters[3] : "-";
+            frame_probe_record(n, label.c_str());
+            out.print("Recording {} frames ({}) -> {}\n", n, label, smoothpan_log_path("smoothpan_watch.txt"));
+        } else {
+            char buf[240];
+            frame_probe_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+        }
     } else if (parameters.size() >= 1 && parameters[0] == "compositor") {
         const std::string sub = parameters.size() >= 2 ? parameters[1] : "status";
         if (sub == "on") {
@@ -812,6 +833,9 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         } else if (sub == "off") {
             compositor_set_enabled(false);
             out.print("Compositor: OFF (direct pan path, exactly as 3.23.x; smooth zoom unavailable).\n");
+        } else if (sub == "testleak") {
+            compositor_test_leak(parameters.size() >= 3 ? std::stoi(parameters[2]) : 1);
+            out.print("Simulating a render-target leak on the next presents (guard should repair it).\n");
         } else {
             char buf[320];
             compositor_status(buf, sizeof(buf));
@@ -954,13 +978,21 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
     if (enable) {
         mouse_comp_set_both_armed_handler(smoothpan_on_mouse_both_armed);
         if (!is_enabled) {
+            // Cancel a teardown the render thread has not got to yet BEFORE we
+            // flip is_enabled, so the present hook cannot remove the hooks out
+            // from under us.  If the hooks are still installed, do not install
+            // them again: the GOT slots already hold our detours, so a second
+            // install would record the detour as the "original" and recurse.
+            g_sp_teardown_pending.store(false, std::memory_order_release);
+            const bool hooks_live = sp_hooks_active();
             is_enabled = true;
             g_camera.reset();
             zoom_probe_reset();
             zoom_camera_reset();
             compositor_reset();
+            frame_probe_reset();
             g_shift_mode = ShiftMode::Sdl;
-            const bool sdl_ok = InitSDLHooks();
+            const bool sdl_ok = hooks_live ? true : InitSDLHooks();
             const bool r2d_ok = renderer_hook_install();
             g_dwarfmode_hook_report.clear();
             auto note = [](const char* name, bool applied) {
@@ -990,7 +1022,11 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
         restore_map_port_shift();
         g_camera.end_render_overscan();
         renderer_hook_remove();
-        CleanupSDLHooks();
+        // SDL hooks come off on the render thread at the next present, after
+        // compositor_guard_present has handed DF its render target back.  Doing
+        // it here could strand an open capture with our texture bound: that is
+        // the permanent strobe/freeze seen in 3.27.0.
+        g_sp_teardown_pending.store(true, std::memory_order_release);
         INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
         INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).remove();
         INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();
@@ -1004,8 +1040,11 @@ DFhackCExport command_result plugin_shutdown(color_ostream &out) {
         restore_map_port_shift();
         g_camera.end_render_overscan();
         renderer_hook_remove();
-        CleanupSDLHooks();
     }
+    // Unload: the plugin's code is about to disappear, so the hooks must come
+    // off now even if a deferred teardown never ran (no present since disable).
+    if (sp_hooks_active()) CleanupSDLHooks();
+    g_sp_teardown_pending.store(false, std::memory_order_release);
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();

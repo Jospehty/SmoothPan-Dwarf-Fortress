@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "sdl_hook.h"
+#include "frame_probe.h"
 #include "camera.h"
 #include "viewport.h"
 #include "debug_paths.h"
@@ -1075,10 +1076,24 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     // 3.24.0: finalize the retained-frame compositor for this frame (swap the
     // complete bake into the retained slot, restore DF's target if needed).
     if (is_enabled) compositor_on_present(renderer);
+    // Always, enabled or not: never present with our texture as the target.
+    compositor_guard_present(renderer);
+    // Pixel truth: sample what is about to be shown (watchdog + recorder).
+    if (is_enabled) frame_probe_on_present(renderer);
     // Self-test measurements read back the finished frame (HUD included).
     if (is_enabled) selftest_on_present(renderer);
 
     True_SDL_RenderPresent(renderer);
+
+    // Deferred teardown (see plugin_enable).  Removing the GOT hooks here, on
+    // the render thread, after the guard has released any capture, is the
+    // only point where we know no frame of ours is half-built.  Rewriting the
+    // slots from inside this detour is safe: the real present was called via
+    // our saved pointer, not through the slot.
+    if (!is_enabled && g_sp_teardown_pending.load(std::memory_order_acquire)) {
+        g_sp_teardown_pending.store(false, std::memory_order_release);
+        CleanupSDLHooks();
+    }
 }
 
 int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect) {
@@ -1360,6 +1375,8 @@ bool smoothpan_raw_sdl_mouse(int* x, int* y) {
     GetMouseState_func(x, y);
     return true;
 }
+
+std::atomic<bool> g_sp_teardown_pending{false};
 
 void CleanupSDLHooks() {
     sp_hooks_end();

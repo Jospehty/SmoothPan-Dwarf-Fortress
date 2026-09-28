@@ -69,6 +69,27 @@ bool compositor_post_blit(SDL_FRect* rect);
 // Called from the SDL_RenderPresent hook (after telemetry).
 void compositor_on_present(SDL_Renderer* r);
 
+// Safety net, called from the SDL_RenderPresent hook on EVERY present, whether
+// or not the plugin is enabled, immediately before the real present.
+//
+// Invariant: DF must never present while one of our layer textures is the live
+// render target.  If that happens, DF goes on drawing into a texture nobody
+// displays while RenderPresent swaps a window backbuffer that nothing draws to
+// any more; a double-buffered window alternating two stale buffers is a
+// full-rate on/off strobe, and the game looks frozen.  This closes any capture
+// left open (e.g. the plugin was disabled mid-frame), puts DF's own target
+// back if ours is still bound, and self-disables the compositor if it keeps
+// happening.
+void compositor_guard_present(SDL_Renderer* r);
+// Number of times the guard had to repair a leaked render target.
+int compositor_target_leaks();
+// Switch the compositor off from a watchdog, releasing any open capture.
+void compositor_emergency_disable(const char* reason);
+// Test only: on each of the next n presents, bind one of our layer textures as
+// the target after DF has finished the frame, so compositor_guard_present has
+// something to repair.  Nothing visible: the frame is already complete.
+void compositor_test_leak(int n);
+
 // Diagnostics.
 struct CompositorFrameInfo {
     bool started = false;      // a map layer was captured last frame

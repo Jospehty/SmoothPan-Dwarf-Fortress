@@ -1,9 +1,17 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 
 bool InitSDLHooks();
 void CleanupSDLHooks();
+
+// Set by plugin_enable(false).  The SDL hooks are NOT removed on the console
+// thread: removing them there can strand an open compositor capture with our
+// texture still bound as DF's render target, which is a permanent strobe/
+// freeze (nothing left to rebind it).  The present hook removes them on the
+// render thread instead, after compositor_guard_present has released it.
+extern std::atomic<bool> g_sp_teardown_pending;
 
 // Clip the current render target to the map's bake-grid rect [origin, origin+dim*cell]
 // while a map pass is baking, so shifted tiles cannot paint into the on-screen

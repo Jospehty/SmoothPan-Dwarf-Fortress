@@ -5,6 +5,7 @@
 #include "sdl_hook.h"
 #include "camera.h"
 #include "compositor.h"
+#include "frame_probe.h"
 #include "zoom_camera.h"
 #include "renderer_hook.h"
 #include "viewport.h"
@@ -438,6 +439,9 @@ void smoothpan_write_diag(std::string& out) {
     out += st;
     out += "\n";
     zoom_camera_status(st, sizeof(st));
+    out += st;
+    out += "\n";
+    frame_probe_status(st, sizeof(st));
     out += st;
     out += "\n";
     out += "selftest: " + selftest_status() + "\n";

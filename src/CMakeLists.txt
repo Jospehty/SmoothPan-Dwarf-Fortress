@@ -35,6 +35,7 @@ set(SMOOTHPAN_SRCS
     frame_seq.cpp
     zoom_probe.cpp
     compositor.cpp
+    frame_probe.cpp
     zoom_camera.cpp
     platform.cpp
     selftest.cpp
