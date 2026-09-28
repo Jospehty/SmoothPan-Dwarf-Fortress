@@ -22,6 +22,8 @@
 #include "camera.h"
 #include "sdl_hook.h"
 #include "frame_probe.h"
+#include "vblank.h"
+#include "pacing.h"
 #include "debug_paths.h"
 #include "viewport.h"
 #include "version.h"
@@ -835,6 +837,33 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
                 return CR_FAILURE;
             }
         }
+    } else if (parameters.size() >= 2 && parameters[0] == "panpresent") {
+        extern bool g_sp_present_pan;
+        g_sp_present_pan = parameters[1] == "on";
+        out.print("Present-time pan offset: {}.\n", g_sp_present_pan ? "on" : "off (frozen per interpose, pre-3.32)");
+    } else if (parameters.size() >= 1 && parameters[0] == "pace") {
+        // 'pace off|auto|<N>' (show a new frame every Nth display refresh)
+        if (parameters.size() >= 3 && parameters[1] == "record") {
+            pacing_record(std::stoi(parameters[2]), parameters.size() >= 4 ? parameters[3].c_str() : "-");
+        } else if (parameters.size() >= 3 && parameters[1] == "latch") {
+            pacing_set_latch(std::stoi(parameters[2]));
+        } else if (parameters.size() >= 2) {
+            const std::string v = parameters[1];
+            pacing_set_mode(v == "off" ? 0 : (v == "auto" ? -1 : std::max(1, std::stoi(v))));
+        }
+        char buf[320];
+        pacing_status(buf, sizeof(buf));
+        out.print("{}\n", buf);
+    } else if (parameters.size() >= 1 && parameters[0] == "vblank") {
+        if (parameters.size() >= 2) {
+            vblank_probe(std::stoi(parameters[1]));
+            out.print("Recording vblank data for {} presents -> {}\n", parameters[1],
+                      smoothpan_log_path("smoothpan_vblank.txt"));
+        } else {
+            char buf[200];
+            vblank_status(buf, sizeof(buf));
+            out.print("{}\n", buf);
+        }
     } else if (parameters.size() >= 1 && parameters[0] == "vsync") {
         if (parameters.size() >= 2 && (parameters[1] == "on" || parameters[1] == "off")) {
             g_sp_vsync_request.store(parameters[1] == "on" ? 1 : 0, std::memory_order_release);
@@ -1114,6 +1143,7 @@ DFhackCExport command_result plugin_shutdown(color_ostream &out) {
     // Unload: the plugin's code is about to disappear, so the hooks must come
     // off now even if a deferred teardown never ran (no present since disable).
     sp_force_remove_hooks();
+    pacing_shutdown();                   // join the refresh-grid thread before unload
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();

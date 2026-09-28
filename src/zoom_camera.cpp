@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "zoom_camera.h"
+#include "pacing.h"
 
 #include "camera.h"
 #include "compositor.h"
@@ -750,7 +751,8 @@ static float present_v() {
     // here let the displayed size creep toward the target between rungs and snap
     // back when each one landed -- shimmer at the start of a zoom-out flick.
     if (g_freeze_gesture && !g_freeze_hold && g_freeze_us && v > 0.0f && g_freeze_target > 0.0f) {
-        float dt = static_cast<float>(ease_now_us() - g_freeze_ease_us) / 1e6f;
+        // Evaluate for when this frame will be SEEN (pacing lead).
+        float dt = static_cast<float>(ease_now_us() + pacing_frame_lead_us() - g_freeze_ease_us) / 1e6f;
         if (dt > 0.05f) dt = 0.05f;                 // same cap as zoom_camera_update
         float vel = g_freeze_vel;
         v = spring_step(v, &vel, g_freeze_target, g_rate, dt);

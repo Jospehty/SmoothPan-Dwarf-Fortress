@@ -1,6 +1,8 @@
 #define NOMINMAX
 #include "sdl_hook.h"
 #include "frame_probe.h"
+#include "vblank.h"
+#include "pacing.h"
 #include "camera.h"
 #include "viewport.h"
 #include "debug_paths.h"
@@ -1127,7 +1129,10 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     // Self-test measurements read back the finished frame (HUD included).
     if (is_enabled) selftest_on_present(renderer);
 
+    if (is_enabled) pacing_before_present(renderer);
     True_SDL_RenderPresent(renderer);
+    if (is_enabled) pacing_after_present();
+    if (is_enabled) vblank_on_present(renderer);
 
     // Deferred teardown (see plugin_enable).  Removing the GOT hooks here, on
     // the render thread, after the guard has released any capture, is the

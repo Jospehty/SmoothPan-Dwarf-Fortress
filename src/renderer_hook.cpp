@@ -1,6 +1,7 @@
 #include "renderer_hook.h"
 
 #include "camera.h"
+#include "pacing.h"
 #include "compositor.h"
 #include "debug_paths.h"
 #include "frame_seq.h"
@@ -175,10 +176,27 @@ static void renderer_log_on_present_tick() {
     }
 }
 
+// Start of a render-thread frame: DF's renderer draws the map viewports (where
+// every map blit happens) BEFORE renderer_2d::render(), which only copies the
+// finished screen and presents.  Frame-level decisions -- which refresh this
+// frame is aimed at (pacing) and the pan offset for it -- must therefore be
+// taken at the first viewport update, not at render() (measured: render() to
+// present is ~0.1-0.3 ms, so decisions made there applied to the NEXT frame).
+static bool g_frame_begun = false;
+static void smoothpan_frame_begin() {
+    if (g_frame_begun || !is_enabled) return;
+    g_frame_begun = true;
+    auto* r2d_now = virtual_cast<df::renderer_2d>(
+        df::global::enabler ? df::global::enabler->renderer : nullptr);
+    if (r2d_now) pacing_on_frame_start(reinterpret_cast<SDL_Renderer*>(r2d_now->sdl_renderer));
+    g_camera.begin_present();
+}
+
 struct smoothpan_renderer_2d_hook : public df::renderer_2d {
     typedef df::renderer_2d interpose_base;
 
     DEFINE_VMETHOD_INTERPOSE(void, update_full_map_port, (df::graphic_map_portst* vp)) {
+        smoothpan_frame_begin();
         trace_on_update_full_map_port_begin(vp);
         renderer_log_line("update_full_map_port BEGIN", vp, nullptr);
         INTERPOSE_NEXT(update_full_map_port)(vp);
@@ -187,6 +205,7 @@ struct smoothpan_renderer_2d_hook : public df::renderer_2d {
     }
 
     DEFINE_VMETHOD_INTERPOSE(void, update_full_viewport, (df::graphic_viewportst* vp)) {
+        smoothpan_frame_begin();
         trace_on_update_full_viewport_begin(vp);
         renderer_log_line("update_full_viewport BEGIN", nullptr, vp);
 
@@ -284,8 +303,8 @@ struct smoothpan_renderer_2d_hook : public df::renderer_2d {
     }
 
     DEFINE_VMETHOD_INTERPOSE(void, render, ()) {
-        // Pan offset for THIS present (see SmoothCamera::begin_present).
-        if (is_enabled) g_camera.begin_present();
+        // Fallback frame start for frames that update no viewport (menus).
+        smoothpan_frame_begin();
         trace_on_renderer_render_begin();
         renderer_log_line("render BEGIN", nullptr, nullptr);
         INTERPOSE_NEXT(render)();
@@ -302,6 +321,7 @@ struct smoothpan_renderer_2d_hook : public df::renderer_2d {
         g_in_post_viewport_map_shift.store(false, std::memory_order_relaxed);
         trace_on_renderer_render_end();
         renderer_log_line("render END", nullptr, nullptr);
+        g_frame_begun = false;               // next viewport update starts a new frame
     }
 
     DEFINE_VMETHOD_INTERPOSE(void, zoom, (df::zoom_commands cmd)) {

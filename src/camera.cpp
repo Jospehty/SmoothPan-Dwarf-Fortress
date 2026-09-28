@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "camera.h"
+#include "pacing.h"
 #include <cmath>
 #include <chrono>
 #include "platform.h"
@@ -429,16 +430,21 @@ static int tile_cell_px() {
     return (z > 3) ? z / 4 : 0;
 }
 
+bool g_sp_present_pan = true;   // A/B switch: false = pre-3.32 frozen-per-interpose offset
+
 void SmoothCamera::begin_present() {
+    if (!g_sp_present_pan) { present_valid = false; return; }
     const long long fus = frozen_us.load(std::memory_order_acquire);
     float fx = frame_frac_x.load(std::memory_order_relaxed);
     float fy = frame_frac_y.load(std::memory_order_relaxed);
     if (fus) {
+        // Content for when the frame will be SEEN (pacing lead), not rendered.
         const long long now = std::chrono::duration_cast<std::chrono::microseconds>(
-                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+                                  std::chrono::steady_clock::now().time_since_epoch()).count() +
+                              pacing_frame_lead_us();
         float dt = static_cast<float>(now - fus) / 1e6f;
         if (dt < 0.0f) dt = 0.0f;
-        if (dt > 0.03f) dt = 0.03f;          // never extrapolate across a long stall
+        if (dt > 0.045f) dt = 0.045f;        // never extrapolate across a long stall
         fx += frozen_vx.load(std::memory_order_relaxed) * dt;
         fy += frozen_vy.load(std::memory_order_relaxed) * dt;
     }
