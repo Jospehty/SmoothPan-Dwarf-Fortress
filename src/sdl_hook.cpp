@@ -35,6 +35,8 @@
 #include <string>
 #include <cstdio>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 // Shared typedefs (RenderCopyF, SetClipRect, SetRenderTarget, SetViewport,
@@ -1090,10 +1092,7 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
     // only point where we know no frame of ours is half-built.  Rewriting the
     // slots from inside this detour is safe: the real present was called via
     // our saved pointer, not through the slot.
-    if (!is_enabled && g_sp_teardown_pending.load(std::memory_order_acquire)) {
-        g_sp_teardown_pending.store(false, std::memory_order_release);
-        CleanupSDLHooks();
-    }
+    if (!is_enabled) sp_render_thread_teardown_point();
 }
 
 int Hook_SDL_RenderCopy(SDL_Renderer* renderer, SDL_Texture* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect) {
@@ -1376,7 +1375,50 @@ bool smoothpan_raw_sdl_mouse(int* x, int* y) {
     return true;
 }
 
-std::atomic<bool> g_sp_teardown_pending{false};
+std::atomic<int> g_sp_hook_state{SP_HOOKS_REMOVED};
+
+static void wait_while_removing() {
+    for (int i = 0; i < 2000 && g_sp_hook_state.load(std::memory_order_acquire) == SP_HOOKS_REMOVING; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+bool sp_ensure_hooks() {
+    int e = SP_HOOKS_TEARDOWN;
+    if (g_sp_hook_state.compare_exchange_strong(e, SP_HOOKS_LIVE)) return true;   // cancelled in time
+    wait_while_removing();
+    const int st = g_sp_hook_state.load(std::memory_order_acquire);
+    if (st == SP_HOOKS_LIVE) return true;
+    if (st == SP_HOOKS_REMOVING) return false;   // render thread stuck mid-removal: never double-install
+    const bool ok = InitSDLHooks();
+    g_sp_hook_state.store(sp_hooks_active() ? SP_HOOKS_LIVE : SP_HOOKS_REMOVED, std::memory_order_release);
+    return ok;
+}
+
+void sp_request_hook_teardown() {
+    int e = SP_HOOKS_LIVE;
+    g_sp_hook_state.compare_exchange_strong(e, SP_HOOKS_TEARDOWN);
+}
+
+void sp_render_thread_teardown_point() {
+    int e = SP_HOOKS_TEARDOWN;
+    if (!g_sp_hook_state.compare_exchange_strong(e, SP_HOOKS_REMOVING)) return;
+    CleanupSDLHooks();
+    g_sp_hook_state.store(SP_HOOKS_REMOVED, std::memory_order_release);
+}
+
+void sp_force_remove_hooks() {
+    wait_while_removing();
+    if (sp_hooks_active()) CleanupSDLHooks();
+    g_sp_hook_state.store(SP_HOOKS_REMOVED, std::memory_order_release);
+}
+
+void sp_reinstall_hooks() {
+    // Only meaningful while live; otherwise enable installs fresh.
+    if (g_sp_hook_state.load(std::memory_order_acquire) != SP_HOOKS_LIVE) return;
+    CleanupSDLHooks();
+    InitSDLHooks();
+    g_sp_hook_state.store(sp_hooks_active() ? SP_HOOKS_LIVE : SP_HOOKS_REMOVED, std::memory_order_release);
+}
 
 void CleanupSDLHooks() {
     sp_hooks_end();

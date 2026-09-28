@@ -1,5 +1,5 @@
 #pragma once
 
-#define SMOOTHPAN_BUILD_VERSION "3.28.2"
+#define SMOOTHPAN_BUILD_VERSION "3.31.3"
 
-inline const char SMOOTHPAN_BUILD_TAG[] = "SMOOTHPAN_BUILD=3.28.2";
+inline const char SMOOTHPAN_BUILD_TAG[] = "SMOOTHPAN_BUILD=3.31.3";

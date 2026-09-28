@@ -45,14 +45,25 @@ constexpr int kStrobeRun = 4;
 constexpr float kFlipD1 = 40.0f;
 constexpr float kFlipRatio = 0.35f;
 constexpr int kFlipRun = 6;
+// Blackout: during zoom activity the map turning black well beyond what it
+// was when the activity began, for longer than a rebake stall.  Scoped to zoom
+// activity so a legitimately dark view (an unexplored z-level) cannot trip it.
+// Added after 'commit direct' left 58-72% of the map black with no alternation
+// for the flip/strobe rules to see.
+constexpr float kBlackoutRise = 0.40f;
+constexpr int kBlackoutMs = 250;
 
 bool g_watchdog = true;
 int g_trips = 0;
 int g_present = 0;                   // our own present counter
 long long g_last_present_us = 0;
 long long g_hot_until_us = 0;
+bool g_was_hot = false;
+float g_hot_base_black = -1.0f;      // black fraction when zoom activity began
+long long g_blackout_since_us = 0;
 
 int g_record_left = 0;
+bool g_record_nopix = false;   // timing/state only: no GPU readback
 int g_test_strobe_left = 0;
 FILE* g_rec = nullptr;
 
@@ -141,7 +152,7 @@ void trip(const char* why) {
         // plugin out of the render path.  Interposes fall through when
         // is_enabled is false; the SDL hooks come off at the next present.
         is_enabled = false;
-        g_sp_teardown_pending.store(true, std::memory_order_release);
+        sp_request_hook_teardown();
         g_camera.end_render_overscan();
         DFHack::Core::getInstance().getConsole().printerr(
             "SmoothPan: display still alternating with the compositor off ({}). Plugin taken out of "
@@ -184,6 +195,24 @@ void frame_probe_on_present(SDL_Renderer* r) {
     const bool burst = (present % kBurstPeriod) < kBurstLen;
     if (!recording && !testing && !(g_watchdog && (hot || burst))) return;
 
+    if (recording && g_record_nopix) {
+        // Timing/state only.  Reading pixels back forces a GPU sync, which on a
+        // frame where DF is uploading a rebake inflates exactly the frame time
+        // we are trying to measure.
+        if (g_rec) {
+            CompositorFrameInfo ci;
+            compositor_last_frame(&ci);
+            fprintf(g_rec,
+                    "f=%d ms=%.1f black=-1 d1=-1 d2=-1 flip=0 choice=%d cell=%d scale=%.5f "
+                    "map=%d v=%.4f tgt=%d baked=%d gest=%d pend=%d trans=%d leaks=%d\n",
+                    present, frame_ms, ci.choice, ci.cell, ci.scale, ci.map_blits, zi.v, zi.target_cell,
+                    zi.baked_cell, zi.gesture ? 1 : 0, zi.pending ? 1 : 0,
+                    zoom_transition_active() ? 1 : 0, compositor_target_leaks());
+        }
+        if (--g_record_left == 0 && g_rec) { fprintf(g_rec, "# end\n"); fclose(g_rec); g_rec = nullptr; }
+        return;
+    }
+
     // Shift history and sample.
     g_s[2] = g_s[1];
     g_s[1] = g_s[0];
@@ -208,6 +237,19 @@ void frame_probe_on_present(SDL_Renderer* r) {
     const bool flip = c2 && d1 >= kFlipD1 && d2 < kFlipRatio * d1;
     const float swing = c1 ? std::fabs(s.black - g_s[1].black) : 0.0f;
     g_last_black = s.black;
+    // Blackout bookkeeping (zoom activity only).
+    if (hot && !g_was_hot) { g_hot_base_black = -1.0f; g_blackout_since_us = 0; }
+    g_was_hot = hot;
+    if (hot) {
+        if (g_hot_base_black < 0.0f) g_hot_base_black = s.black;
+        if (s.black > g_hot_base_black + kBlackoutRise) {
+            if (!g_blackout_since_us) g_blackout_since_us = now;
+        } else {
+            g_blackout_since_us = 0;
+        }
+    } else {
+        g_blackout_since_us = 0;
+    }
     g_last_d1 = d1;
     g_last_d2 = d2;
 
@@ -219,8 +261,8 @@ void frame_probe_on_present(SDL_Renderer* r) {
         CompositorFrameInfo ci;
         compositor_last_frame(&ci);
         fprintf(g_rec,
-                "f=%d ms=%.1f black=%.4f d1=%.1f d2=%.1f flip=%d choice=%d cell=%d scale=%.3f "
-                "map=%d v=%.2f tgt=%d baked=%d gest=%d pend=%d trans=%d leaks=%d\n",
+                "f=%d ms=%.1f black=%.4f d1=%.1f d2=%.1f flip=%d choice=%d cell=%d scale=%.5f "
+                "map=%d v=%.4f tgt=%d baked=%d gest=%d pend=%d trans=%d leaks=%d\n",
                 present, frame_ms, s.black, d1, d2, flip ? 1 : 0, ci.choice, ci.cell, ci.scale,
                 ci.map_blits, zi.v, zi.target_cell, zi.baked_cell, zi.gesture ? 1 : 0,
                 zi.pending ? 1 : 0, zoom_transition_active() ? 1 : 0, compositor_target_leaks());
@@ -232,6 +274,11 @@ void frame_probe_on_present(SDL_Renderer* r) {
             snprintf(why, sizeof(why), "black fraction swung >%.0f%% on %d consecutive frames",
                      kStrobeBlackSwing * 100.0f, g_strobe_run);
             trip(why);
+        } else if (g_blackout_since_us && (now - g_blackout_since_us) / 1000 > kBlackoutMs) {
+            snprintf(why, sizeof(why), "map %.0f%% black during zoom (was %.0f%%) for >%d ms",
+                     s.black * 100.0f, g_hot_base_black * 100.0f, kBlackoutMs);
+            trip(why);
+            g_blackout_since_us = 0;
         } else if (g_flip_run >= kFlipRun) {
             snprintf(why, sizeof(why), "frame flip-flop d1=%.0f d2=%.0f on %d consecutive frames",
                      d1, d2, g_flip_run);
@@ -246,7 +293,8 @@ void frame_probe_on_present(SDL_Renderer* r) {
     }
 }
 
-void frame_probe_record(int frames, const char* label) {
+void frame_probe_record(int frames, const char* label, bool nopix) {
+    g_record_nopix = nopix;
     if (g_rec) { fclose(g_rec); g_rec = nullptr; }
     g_record_left = std::max(0, frames);
     if (!g_record_left) return;

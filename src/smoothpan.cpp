@@ -57,8 +57,7 @@ REQUIRE_GLOBAL(gview);
 REQUIRE_GLOBAL(cursor);
 
 static void smoothpan_on_mouse_both_armed() {
-    CleanupSDLHooks();
-    InitSDLHooks();
+    sp_reinstall_hooks();
     Core::getInstance().getConsole().print("SmoothPan mouse: both (world + UI).\n");
 }
 
@@ -294,16 +293,30 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             const int dir = input->count(df::interface_key::ZOOM_IN) ? +1 : -1;
             if (dir > 0) zoom_probe_note_feed_zoom_in(); else zoom_probe_note_feed_zoom_out();
             bool over_map = false;
+            // Why the gate said what it said, for the zoom log: -1 no mouse,
+            // -2 no strict viewport, 0 map, 1-4 outside viewport L/R/T/B,
+            // 5 DF widget, 6 premium panel, 7 other UI widget, 8 left/above origin.
+            int gate = -1;
+            int rx = -1, ry = -1;
             {
-                int rx = -1, ry = -1;
                 ViewportRect vp;
                 // A test cursor override stands in for the real mouse so a
                 // scripted wheel event exercises this exact branch.
                 const bool have = zoom_camera_test_cursor(&rx, &ry) ||
                                   smoothpan_raw_sdl_mouse(&rx, &ry);
-                if (have && get_strict_viewport_rect(&vp))
+                if (!have) gate = -1;
+                else if (!get_strict_viewport_rect(&vp)) gate = -2;
+                else {
                     over_map = smoothpan_middle_mouse_map_gate(rx - vp.origin_x, ry - vp.origin_y);
+                    if (rx - vp.origin_x < 0 || ry - vp.origin_y < 0) gate = 8;
+                    else {
+                        gate = IsMouseInUI_reason(rx, ry, nullptr);
+                        if (gate == 5) gate = 0;   // container hit: not UI (see camera.cpp gate)
+                        if (gate == 0 && mouse_over_ui_widget(rx, ry)) gate = 7;
+                    }
+                }
             }
+            const bool gate_over_map = over_map;
             // Once a wheel gesture over the map is under way, keep it.  This
             // test is re-run per wheel event from two live reads (the SDL
             // mouse and a strict viewport rect), and during vanilla's rebake --
@@ -316,10 +329,12 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
             // to jumping between zoom levels" symptom.  The gesture already has
             // a pinned anchor, so continuing to own it is the correct call.
             if (!over_map && zoom_camera_in_gesture()) over_map = true;
-            if (over_map && zoom_camera_on_zoom_key(dir, over_map)) {
+            const bool taken = over_map && zoom_camera_on_zoom_key(dir, over_map);
+            if (taken) {
                 input->erase(df::interface_key::ZOOM_IN);
                 input->erase(df::interface_key::ZOOM_OUT);
             }
+            zoom_camera_log_wheel(dir, rx, ry, gate, gate_over_map, over_map, taken);
         }
 
         const bool mmb_held = smoothpan_middle_mouse_button_held();
@@ -768,6 +783,9 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
             zoom_camera_set_commit_direct(direct);
             out.print("Smooth zoom commit path: {}.\n",
                       direct ? "direct set_viewport_zoom_factor" : "vanilla feed ZOOM_IN/OUT");
+            if (direct)
+                out.printerr("WARNING: direct commits skip DF's own rebake: measured 58% of the map black "
+                             "and commit timeouts (3.31.0).  Diagnostics only; use 'commit feed'.\n");
         } else if (sub == "test" && parameters.size() >= 3) {
             const int dir = (parameters[2] == "in") ? +1 : -1;
             zoom_camera_queue_test_step(dir);
@@ -818,7 +836,8 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         } else if (sub == "record" && parameters.size() >= 3) {
             const int n = std::stoi(parameters[2]);
             const std::string label = parameters.size() >= 4 ? parameters[3] : "-";
-            frame_probe_record(n, label.c_str());
+            const bool nopix = parameters.size() >= 5 && parameters[4] == "nopix";
+            frame_probe_record(n, label.c_str(), nopix);
             out.print("Recording {} frames ({}) -> {}\n", n, label, smoothpan_log_path("smoothpan_watch.txt"));
         } else {
             char buf[240];
@@ -978,21 +997,20 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
     if (enable) {
         mouse_comp_set_both_armed_handler(smoothpan_on_mouse_both_armed);
         if (!is_enabled) {
-            // Cancel a teardown the render thread has not got to yet BEFORE we
-            // flip is_enabled, so the present hook cannot remove the hooks out
-            // from under us.  If the hooks are still installed, do not install
-            // them again: the GOT slots already hold our detours, so a second
-            // install would record the detour as the "original" and recurse.
-            g_sp_teardown_pending.store(false, std::memory_order_release);
-            const bool hooks_live = sp_hooks_active();
-            is_enabled = true;
+            // Hooks first, and only through the state machine (see sdl_hook.h):
+            // cancels a teardown the render thread has not reached, waits out
+            // one it is in the middle of, never installs twice.
+            const bool sdl_ok = sp_ensure_hooks();
+            // Reset everything while is_enabled is still false: the hooks are
+            // live but inert, so the render thread cannot be halfway through a
+            // capture that compositor_reset() clobbers from this thread.
             g_camera.reset();
             zoom_probe_reset();
             zoom_camera_reset();
             compositor_reset();
             frame_probe_reset();
             g_shift_mode = ShiftMode::Sdl;
-            const bool sdl_ok = hooks_live ? true : InitSDLHooks();
+            is_enabled = true;
             const bool r2d_ok = renderer_hook_install();
             g_dwarfmode_hook_report.clear();
             auto note = [](const char* name, bool applied) {
@@ -1026,7 +1044,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out, bool enable) {
         // compositor_guard_present has handed DF its render target back.  Doing
         // it here could strand an open capture with our texture bound: that is
         // the permanent strobe/freeze seen in 3.27.0.
-        g_sp_teardown_pending.store(true, std::memory_order_release);
+        sp_request_hook_teardown();
         INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
         INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).remove();
         INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();
@@ -1043,8 +1061,7 @@ DFhackCExport command_result plugin_shutdown(color_ostream &out) {
     }
     // Unload: the plugin's code is about to disappear, so the hooks must come
     // off now even if a deferred teardown never ran (no present since disable).
-    if (sp_hooks_active()) CleanupSDLHooks();
-    g_sp_teardown_pending.store(false, std::memory_order_release);
+    sp_force_remove_hooks();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, feed).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, logic).remove();
     INTERPOSE_HOOK(smoothpan_dwarfmode_hook, render).remove();

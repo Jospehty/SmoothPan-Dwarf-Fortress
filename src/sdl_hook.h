@@ -6,12 +6,27 @@
 bool InitSDLHooks();
 void CleanupSDLHooks();
 
-// Set by plugin_enable(false).  The SDL hooks are NOT removed on the console
-// thread: removing them there can strand an open compositor capture with our
-// texture still bound as DF's render target, which is a permanent strobe/
-// freeze (nothing left to rebind it).  The present hook removes them on the
-// render thread instead, after compositor_guard_present has released it.
-extern std::atomic<bool> g_sp_teardown_pending;
+// SDL hook lifecycle.  DF's render thread keeps presenting while DFHack
+// console commands run, so hook removal and re-install are coordinated through
+// one atomic state, every transition a compare-and-swap:
+//
+//   REMOVED --sp_ensure_hooks--> LIVE --sp_request_hook_teardown--> TEARDOWN
+//   TEARDOWN --present hook--> REMOVING --> REMOVED     (render thread)
+//   TEARDOWN --sp_ensure_hooks--> LIVE                  (re-enable cancels)
+//
+// Removal happens only on the render thread, after compositor_guard_present has
+// handed DF its render target back; removing on the console thread could strand
+// an open capture with our texture bound (the 3.27.0 permanent strobe).  A plain
+// "pending" flag was not enough: enable could clear it and skip re-installing
+// while the render thread was already inside the removal, leaving the plugin
+// enabled with no hooks (seen live in 3.28.2).
+enum SpHookState : int { SP_HOOKS_REMOVED = 0, SP_HOOKS_LIVE = 1, SP_HOOKS_TEARDOWN = 2, SP_HOOKS_REMOVING = 3 };
+extern std::atomic<int> g_sp_hook_state;
+bool sp_ensure_hooks();                         // console thread; true if hooks are live
+void sp_request_hook_teardown();                // any thread; LIVE -> TEARDOWN
+void sp_render_thread_teardown_point();         // present hook, after the real present
+void sp_force_remove_hooks();                   // plugin unload
+void sp_reinstall_hooks();                      // console thread; re-resolve all hooks
 
 // Clip the current render target to the map's bake-grid rect [origin, origin+dim*cell]
 // while a map pass is baking, so shifted tiles cannot paint into the on-screen

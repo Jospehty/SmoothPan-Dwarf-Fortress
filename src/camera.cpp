@@ -225,9 +225,11 @@ bool smoothpan_middle_mouse_map_gate(int precise_x, int precise_y) {
     if (!get_strict_viewport_rect(&vp)) return false;
     int raw_x = precise_x + vp.origin_x;
     int raw_y = precise_y + vp.origin_y;
-    if (IsMouseInUI_reason(raw_x, raw_y, nullptr) != 0) return false;
-    if (mouse_over_ui_widget(raw_x, raw_y)) return false;
-    return true;
+    // Same rule as the click gate (mouse_gate_should_compensate): outside the
+    // viewport, a premium panel, or a VISIBLE LEAF widget is UI.  A container's
+    // own rect (IsMouseInUI_reason == 5) is not: containers span map area, and
+    // counting them sent wheel notches over open map to vanilla.
+    return mouse_gate_should_compensate(raw_x, raw_y, nullptr);
 }
 
 void SmoothCamera::sync_true_from_window() {

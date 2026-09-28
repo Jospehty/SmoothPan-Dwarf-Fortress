@@ -28,7 +28,8 @@ void frame_probe_reset();
 
 // Sample every frame for the next `frames` presents and write one line per
 // frame to smoothpan_watch.txt (appended; `label` marks the block).
-void frame_probe_record(int frames, const char* label);
+// nopix: log timing and state only, no pixel readback (see frame_probe.cpp).
+void frame_probe_record(int frames, const char* label, bool nopix = false);
 bool frame_probe_recording();
 
 // The strobe watchdog.  On: trips the compositor off if the presented map

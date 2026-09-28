@@ -21,13 +21,33 @@ using namespace DFHack;
 
 static bool widget_covers_screen(const df::widget* w);  // defined below
 
-// Widget rects (extentst / sx,sy,ex,ey) are in TEXT-CELL units, not pixels.
-// One text cell = viewport_zoom_factor / 16 pixels (12 px at the default z=192).
-// All pixel ↔ text-cell conversions go through this helper.
-static int text_cell_px() {
-    if (!df::global::gps) return 0;
-    int z = df::global::gps->viewport_zoom_factor;
-    return (z >= 16) ? z / 16 : 0;
+// Widget rects (extentst / sx,sy,ex,ey) are in DF's interface text grid:
+// gps->dimx x gps->dimy cells across the window (182 x 68 at 2560x1440 here).
+// Cells are NOT square (~14.1 x 21.2 px there) and do NOT change with the map
+// zoom.  Verified live: this mapping reproduces DF's own gps->mouse_x/y exactly.
+//
+// Until 3.28.5 this was a square cell of viewport_zoom_factor/16 px -- the MAP
+// zoom -- which is wrong on both axes.  At 2560x1440 it put the cursor ~18 rows
+// too low, and it made the full-screen root widget container fail
+// widget_covers_screen() (1440/12 = 120 "rows" vs its real 68), so the root
+// container's own rect counted as UI everywhere.  The click gate already
+// ignored container hits (reason 5), which is why clicks worked; the wheel/MMB
+// map gate did not, so smooth zoom handed notches to vanilla over open map.
+static bool ui_grid(long long* dimx, long long* dimy, long long* spx, long long* spy) {
+    auto* g = df::global::gps;
+    if (!g || g->dimx <= 0 || g->dimy <= 0 || g->screen_pixel_x <= 0 || g->screen_pixel_y <= 0) return false;
+    *dimx = g->dimx; *dimy = g->dimy; *spx = g->screen_pixel_x; *spy = g->screen_pixel_y;
+    return true;
+}
+static int ui_cell_x(int px) {
+    long long dx, dy, sx, sy;
+    if (!ui_grid(&dx, &dy, &sx, &sy)) return -1;
+    return static_cast<int>((static_cast<long long>(px) * dx) / sx);
+}
+static int ui_cell_y(int py) {
+    long long dx, dy, sx, sy;
+    if (!ui_grid(&dx, &dy, &sx, &sy)) return -1;
+    return static_cast<int>((static_cast<long long>(py) * dy) / sy);
 }
 
 // Diagnostics: rect (text cells) of the widget that matched the last
@@ -38,11 +58,10 @@ int g_matched_widget_is_container = 0;
 
 static bool check_widget_visible_at(df::widget* w, int mx, int my) {
     if (!w) return false;
-    int tc = text_cell_px();
-    if (tc <= 0) return false;
-    // Convert pixel mouse position to text-cell coordinates for widget rect comparison.
-    int tx = mx / tc;
-    int ty = my / tc;
+    // Pixel mouse position -> interface text cell (see ui_cell_x).
+    const int tx = ui_cell_x(mx);
+    const int ty = ui_cell_y(my);
+    if (tx < 0 || ty < 0) return false;
 
     df::widget_container* container = virtual_cast<df::widget_container>(w);
     if (container) {
@@ -78,24 +97,21 @@ static bool widget_covers_screen(const df::widget* w) {
     if (!w || !df::global::gps) return false;
     int ww = w->rect.x2 - w->rect.x1;  // text cells
     int wh = w->rect.y2 - w->rect.y1;  // text cells
-    int tc = text_cell_px();
-    if (tc <= 0) return false;
-    // Convert screen pixel size to text-cell units for apples-to-apples comparison.
-    int sw = df::global::gps->screen_pixel_x / tc;
-    int sh = df::global::gps->screen_pixel_y / tc;
+    // The screen, in interface text cells, is simply the grid size.
+    const int sw = df::global::gps->dimx;
+    const int sh = df::global::gps->dimy;
     if (sw <= 0 || sh <= 0) return ww > 130 && wh > 40;
     return ww >= sw * 85 / 100 && wh >= sh * 85 / 100;
 }
 
 static bool check_widget_overlay_intersects(df::widget* w, const SDL_Rect* r) {
     if (!w || !w->flag.bits.VISIBILITY_VISIBLE) return false;
-    int tc = text_cell_px();
-    if (tc <= 0) return false;
-    // Convert pixel blit rect to text-cell coordinates for widget rect comparison.
-    int rx1 = r->x / tc;
-    int ry1 = r->y / tc;
-    int rx2 = (r->x + r->w) / tc;
-    int ry2 = (r->y + r->h) / tc;
+    // Pixel blit rect -> interface text cells (see ui_cell_x).
+    const int rx1 = ui_cell_x(r->x);
+    const int ry1 = ui_cell_y(r->y);
+    const int rx2 = ui_cell_x(r->x + r->w);
+    const int ry2 = ui_cell_y(r->y + r->h);
+    if (rx1 < 0 || ry1 < 0) return false;
 
     df::widget_container* container = virtual_cast<df::widget_container>(w);
     if (container) {
@@ -144,18 +160,19 @@ static bool widgets_contain_point(int mx, int my) {
 // leaf widgets (tabs/buttons/labels).  The dwarfmode map is NOT a widget, so a
 // mid-map cursor matches no leaf (→ compensate), while a cursor over a real UI
 // element matches that leaf (→ skip compensation).  Invisible leaves are ignored.
-static bool leaf_widget_contains_point(df::widget* w, int mx, int my, int tc) {
+static bool leaf_widget_contains_point(df::widget* w, int mx, int my) {
     if (!w) return false;
     df::widget_container* container = virtual_cast<df::widget_container>(w);
     if (container) {
         for (auto& child : container->children) {
-            if (leaf_widget_contains_point(child.get(), mx, my, tc)) return true;
+            if (leaf_widget_contains_point(child.get(), mx, my)) return true;
         }
         return false;  // do NOT match the container region itself
     }
     if (!w->flag.bits.VISIBILITY_VISIBLE) return false;
-    int tx = mx / tc;
-    int ty = my / tc;
+    const int tx = ui_cell_x(mx);
+    const int ty = ui_cell_y(my);
+    if (tx < 0 || ty < 0) return false;
     if (tx >= w->rect.x1 && tx <= w->rect.x2 &&
         ty >= w->rect.y1 && ty <= w->rect.y2) {
         g_matched_widget_x1 = w->rect.x1; g_matched_widget_y1 = w->rect.y1;
@@ -168,10 +185,8 @@ static bool leaf_widget_contains_point(df::widget* w, int mx, int my, int tc) {
 
 bool mouse_over_ui_widget(int mx, int my) {
     if (!df::global::gview) return false;
-    int tc = text_cell_px();
-    if (tc <= 0) return false;
     for (df::viewscreen* vs = &df::global::gview->view; vs; vs = vs->child) {
-        if (leaf_widget_contains_point(&vs->widgets, mx, my, tc)) return true;
+        if (leaf_widget_contains_point(&vs->widgets, mx, my)) return true;
     }
     return false;
 }
@@ -198,13 +213,11 @@ bool rect_intersects_open_panel(const SDL_Rect* r, bool open, int x1, int y1, in
 
 static bool premium_panels_intersect_rect(const SDL_Rect* r) {
     if (!r || !df::global::game) return false;
-    int tc = text_cell_px();
-    if (tc <= 0) return false;
-    // mi.info.rect is in text-cell units (inherited from widget/extentst).
-    // Convert the pixel rect to text cells before comparing.
-    SDL_Rect tr = { r->x / tc, r->y / tc,
-                    std::max(1, r->w / tc),
-                    std::max(1, r->h / tc) };
+    // mi.info.rect is in interface text cells (inherited from widget/extentst).
+    const int cx1 = ui_cell_x(r->x), cy1 = ui_cell_y(r->y);
+    const int cx2 = ui_cell_x(r->x + r->w), cy2 = ui_cell_y(r->y + r->h);
+    if (cx1 < 0 || cy1 < 0) return false;
+    SDL_Rect tr = { cx1, cy1, std::max(1, cx2 - cx1), std::max(1, cy2 - cy1) };
 
     auto& mi = df::global::game->main_interface;
 

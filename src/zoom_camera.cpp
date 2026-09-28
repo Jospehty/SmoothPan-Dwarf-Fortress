@@ -19,6 +19,7 @@
 #include "df/interface_key.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -51,11 +52,12 @@ static bool g_enabled = true;
 // across all four zoom steps): rate 16 -> 0.168, rate 8 -> 0.101, rate 5 ->
 // 0.163.  8 wins because it is the only one that also improves the multi-notch
 // step, and it keeps the magnification excursion moderate (1.58 vs 2.00 at 5).
-static float g_rate = 8.0f;
+static float g_rate = 16.0f;             // spring stiffness omega, 1/s
 static bool g_anchor_cursor = true;
 static bool g_commit_direct = false;     // false = inject vanilla ZOOM key; true = set_viewport_zoom_factor
 
 static float g_v = 0.0f;                 // visual cell (px/tile), continuous
+static float g_vel = 0.0f;               // d log(v)/dt of the spring, 1/s
 static int g_target_idx = -1;            // ladder index the wheel is asking for
 static int g_desired_z = 0;              // z we have asked vanilla to bake (0 = none)
 static bool g_pending = false;           // commit requested, complete bake not yet displayed
@@ -73,11 +75,114 @@ static long long g_inject_ready_us = 0;  // earliest time we may inject the next
 // counts gave at 50 fps.
 static constexpr int kInjectIntervalMs = 60;
 static constexpr int kCommitTimeoutMs = 300;
+// Zoom-in magnifies the bake on screen until arrival; beyond this scale take an
+// intermediate rung instead (2.05 lets any single flick of up to 2x -- e.g.
+// 24 -> 48 -- commit exactly once).
+static constexpr float kMaxHoldScale = 2.05f;
 
 static long long zc_now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// ---- Ease clock --------------------------------------------------------------
+// The glide is driven by a FRAME-PACED clock, not the wall clock.  Every ladder
+// commit makes DF rebake the map, which blocks the render thread for 55-75 ms
+// (measured identical with smooth zoom off: it is DF's cost, not ours).  On the
+// wall clock the next frame then shows 75 ms of ease at once -- a lurch in the
+// middle of the glide.  This clock credits each present with at most kMaxFrames
+// typical frame times, so across a hitch the glide pauses and then carries on
+// smoothly.  Both the main-thread update and the present-time evaluation read
+// it, so they never disagree about where the ease is.
+static std::atomic<long long> g_ease_clock_us{0};     // advanced on present
+static std::atomic<long long> g_ease_last_present_us{0};
+static std::atomic<long long> g_ease_typ_frame_us{16667};
+static constexpr float kMaxFrames = 2.0f;
+
+static long long ease_cap_us() {
+    const long long typ = g_ease_typ_frame_us.load(std::memory_order_relaxed);
+    return static_cast<long long>(kMaxFrames * static_cast<float>(typ));
+}
+
+// Ease clock "now", callable from either thread.
+static long long ease_now_us() {
+    const long long last = g_ease_last_present_us.load(std::memory_order_acquire);
+    if (last == 0) return zc_now_us();                 // no presents yet: wall clock
+    long long since = zc_now_us() - last;
+    if (since < 0) since = 0;
+    const long long cap = ease_cap_us();
+    if (since > cap) since = cap;
+    return g_ease_clock_us.load(std::memory_order_acquire) + since;
+}
+
+static void ease_clock_on_present() {
+    const long long now = zc_now_us();
+    const long long last = g_ease_last_present_us.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_ease_clock_us.store(now, std::memory_order_release);
+        g_ease_last_present_us.store(now, std::memory_order_release);
+        return;
+    }
+    long long dt = now - last;
+    if (dt < 0) dt = 0;
+    // Typical frame: slow EMA over non-outlier frames.
+    long long typ = g_ease_typ_frame_us.load(std::memory_order_relaxed);
+    const long long clipped = dt > 3 * typ ? 3 * typ : dt;
+    typ = (typ * 15 + clipped) / 16;
+    if (typ < 1000) typ = 1000;
+    g_ease_typ_frame_us.store(typ, std::memory_order_relaxed);
+    const long long cap = ease_cap_us();
+    g_ease_clock_us.fetch_add(dt > cap ? cap : dt, std::memory_order_acq_rel);
+    g_ease_last_present_us.store(now, std::memory_order_release);
+}
+
+// ---- Ease: critically damped spring in log space ----------------------------
+// x = log(visual cell), velocity in log units per second, stiffness omega
+// (g_rate).  Replaces the exponential approach, which started every glide at
+// its MAXIMUM speed (a 3-notch flick went from rest to ~116 px/frame at the far
+// corner in one frame) and jumped velocity again on every extra notch.  The
+// spring starts from rest, keeps velocity continuous when the target moves
+// mid-glide, and has an exact closed form, so the present-time evaluation stays
+// exact across any frame split.
+//
+// Finish: the last kTailLog of distance is covered at no less than
+// kMinLogSpeed (< 0.5 px/frame of corner movement at 180 fps) so the glide lands
+// exactly in finite time instead of creeping for most of a second -- zoom-in
+// commits its sharp bake on arrival, so a long tail would mean a long blur.
+static constexpr float kMinLogSpeed = 0.04f;
+static constexpr float kTailLog = 0.004f;
+
+static float spring_step(float v, float* vel, float target, float omega, float dt) {
+    if (target <= 0.0f || dt <= 0.0f) return v;
+    const float x0 = std::log(std::max(1.0f, v));
+    const float xt = std::log(target);
+    const float d0 = xt - x0;                    // signed distance still to go
+    if (std::fabs(d0) < 1e-5f) { *vel = 0.0f; return target; }
+    const float sgn = d0 > 0.0f ? 1.0f : -1.0f;
+    const float c1 = x0 - xt;
+    const float c2 = *vel + omega * c1;
+    const float e = std::exp(-omega * dt);
+    float x = xt + (c1 + c2 * dt) * e;
+    float nv = (c2 - omega * (c1 + c2 * dt)) * e;
+    // Never cross the target.  A critically damped spring still overshoots once
+    // when it arrives with velocity to spare (target pulled closer mid-glide);
+    // overshoot-and-return on screen is a direction reversal, so land instead.
+    if ((x - xt) * sgn >= 0.0f) { *vel = 0.0f; return target; }
+    // Finish: inside the last kTailLog, move toward the target at no less than
+    // kMinLogSpeed.  Direction comes from start -> target: taking it from where
+    // the spring ended (3.31.2) pushed the glide BACKWARDS after a hairline
+    // overshoot.
+    if (std::fabs(xt - x) < kTailLog) {
+        const float need = kMinLogSpeed * dt;
+        if ((x - x0) * sgn < need) {
+            x = x0 + sgn * std::min(std::fabs(d0), need);
+            nv = sgn * kMinLogSpeed;
+        }
+        if (std::fabs(xt - x) < 1e-5f) { *vel = 0.0f; return target; }
+    }
+    *vel = nv;
+    return std::exp(x);
 }
 static bool g_gesture = false;           // an ease toward target is in progress
 static float g_anchor_x = 0.0f, g_anchor_y = 0.0f;   // window px
@@ -102,12 +207,35 @@ static float g_display_ax = 0.0f, g_display_ay = 0.0f;
 static float g_frame_v = 0.0f;
 static float g_frame_ax = 0.0f, g_frame_ay = 0.0f;
 static bool g_frozen_this_frame = false;   // freeze() ran since the last present
+// Ease state as of the last freeze(), so the visual cell can be evaluated at
+// PRESENT time.  DF presents more often than it runs the dwarfmode render()
+// interpose (where update/freeze live) once the graphics cap exceeds the main
+// loop rate: at 180 fps, roughly one present in three had no fresh freeze.
+// Those frames used to composite at scale 1.0 -- the raw bake, a full zoom
+// level away from the frames either side -- which is the high-fps "shimmer
+// between two frames".  And even on frozen frames v only advanced at the
+// interpose rate, so the glide moved in uneven steps.  The ease is an
+// exponential in log space, which composes exactly, so evaluating it at present
+// time from the last update's state puts every frame on the true curve.
+static long long g_freeze_us = 0;
+static long long g_freeze_ease_us = 0;
+static float g_freeze_vel = 0.0f;
+static bool g_freeze_hold = false;       // zoom-out commit in flight: glide held
+static bool g_hold = false;              // set by update, read by freeze
+static float g_freeze_target = 0.0f;
+static bool g_freeze_gesture = false;
+static float g_present_v = 0.0f;
+static bool g_present_v_valid = false;
+// No dwarfmode render() for this long: another screen is over the map, do not
+// apply a stale ease (the original reason for the scale-1.0 fallback).
+static constexpr int kFreezeStaleMs = 150;
 
 static int g_test_step = 0;
 static int g_commits = 0, g_landed = 0, g_timeouts = 0, g_external = 0, g_keys = 0;
 static char g_last_event[96] = "";
 
-static std::chrono::steady_clock::time_point g_last_time;
+static long long g_last_ease_us = 0;       // ease clock at the last update
+static long long g_gesture_start_ease_us = 0;   // ease clock when the current gesture began
 static bool g_have_time = false;
 
 static FILE* g_log = nullptr;
@@ -230,6 +358,7 @@ static void apply_anchor_invariance(int cb_new) {
 
 static void external_resync(int cb, const char* why) {
     g_v = static_cast<float>(cb);
+    g_vel = 0.0f;
     g_target_idx = ladder_nearest_index(static_cast<float>(cb));
     g_gesture = false;
     g_pending = false;
@@ -268,6 +397,7 @@ static void inject_step(df::viewscreen* vs, int dir, int desired_z) {
 
 void zoom_camera_reset() {
     g_v = 0.0f;
+    g_vel = 0.0f;
     g_target_idx = -1;
     g_desired_z = 0;
     g_pending = false;
@@ -281,6 +411,9 @@ void zoom_camera_reset() {
     g_display_cell = 0;
     g_display_scale = 1.0f;
     g_frame_v = 0.0f;
+    g_freeze_us = 0;
+    g_freeze_gesture = false;
+    g_present_v_valid = false;
     g_test_step = 0;
     g_have_time = false;
     g_min_idx = 0;
@@ -304,6 +437,12 @@ void zoom_camera_set_test_cursor(int x, int y) {
         g_last_anchor_y = static_cast<float>(y);
         g_last_anchor_valid = true;
     }
+}
+
+void zoom_camera_log_wheel(int dir, int x, int y, int gate, bool gate_over_map, bool over_map, bool taken) {
+    zlog("wheel dir=%+d at=(%d,%d) gate=%d gate_map=%d over_map=%d taken=%d%s",
+         dir, x, y, gate, gate_over_map ? 1 : 0, over_map ? 1 : 0, taken ? 1 : 0,
+         taken ? "" : (over_map ? " (on_zoom_key refused)" : " (-> vanilla)"));
 }
 
 bool zoom_camera_test_cursor(int* x, int* y) {
@@ -336,6 +475,7 @@ bool zoom_camera_on_zoom_key(int dir, bool over_map) {
     const int cb = g_last_gps_z / 4;
     if (!g_gesture) {
         g_gesture = true;
+        g_gesture_start_ease_us = ease_now_us();
         if (g_v <= 0.0f) g_v = static_cast<float>(cb);
         if (g_target_idx < 0) g_target_idx = ladder_nearest_index(static_cast<float>(cb));
         // Anchor for the whole gesture: cursor on map, else viewport centre.
@@ -380,10 +520,17 @@ bool zoom_camera_on_zoom_key(int dir, bool over_map) {
 }
 
 void zoom_camera_update(df::viewscreen* vs) {
-    auto now = std::chrono::steady_clock::now();
+    // Ease time, not wall time (see g_ease_clock_us).
+    const long long enow = ease_now_us();
+    // A gesture that began after the last update only gets the time since it
+    // began.  Integrating from the previous update credited the first visible
+    // step with time from before the wheel notch: one static frame, then a
+    // double step -- a small jolt at the start of every zoom.
+    long long from = g_last_ease_us;
+    if (g_gesture && g_gesture_start_ease_us > from) from = g_gesture_start_ease_us;
     float dt = 1.0f / 60.0f;
-    if (g_have_time) dt = std::chrono::duration<float>(now - g_last_time).count();
-    g_last_time = now;
+    if (g_have_time) dt = static_cast<float>(enow - from) / 1e6f;
+    g_last_ease_us = enow;
     g_have_time = true;
     if (dt < 0.0f) dt = 0.0f;
     if (dt > 0.05f) dt = 0.05f;
@@ -417,6 +564,7 @@ void zoom_camera_update(df::viewscreen* vs) {
         if (g_pending && g_anchor_world_valid) {
             apply_anchor_invariance(cb);
             g_landed++;
+            g_pending_since_us = zc_now_us();    // progress: restart the timeout
             zlog("commit landed z %d -> %d (anchor kept)", g_last_gps_z, gps_z);
         } else {
             // Someone else moved the zoom: nothing of ours to pace.
@@ -452,23 +600,45 @@ void zoom_camera_update(df::viewscreen* vs) {
 
     // Ease the visual cell toward the target in log space (RimWorld-style
     // exponential approach), snapping the asymptotic tail.
-    if (g_gesture) {
-        const float k = 1.0f - std::exp(-g_rate * dt);
-        float lv = std::log(std::max(1.0f, g_v));
-        const float lt = std::log(target_cell);
-        lv += (lt - lv) * k;
-        g_v = std::exp(lv);
-        // A quarter-pixel of tile size is invisible: snap the asymptotic tail.
-        if (std::fabs(g_v - target_cell) <= 0.25f) g_v = target_cell;
-    }
+    // Zooming out, the glide waits at its starting size until every rung of the
+    // commit has landed.  DF accepts one zoom step per frame and rebakes (a
+    // 30-75 ms stall) for each, so a 3-notch flick is ~170 ms of stalls; gliding
+    // between them stuttered.  Waiting reads as a short latency, then a clean
+    // glide.
+    const bool out_commit_pending = g_pending && g_desired_z > 0 && g_desired_z < gps_z;
+    g_hold = out_commit_pending;
+    if (g_gesture && !out_commit_pending) g_v = spring_step(g_v, &g_vel, target_cell, g_rate, dt);
+    else if (out_commit_pending) g_vel = 0.0f;
 
     // Scale must stay >= 1 on whatever bake is on screen: while a commit is
     // pending that is the last displayed bake (possibly the retained one).
     const float floor_cell = static_cast<float>((g_pending && g_display_cell > 0) ? g_display_cell : cb);
-    if (g_v < floor_cell) g_v = floor_cell;
+    if (g_v < floor_cell) {
+        g_v = floor_cell;
+        if (g_vel < 0.0f) g_vel = 0.0f;       // held by the bake on screen: stop pushing into it
+    }
 
-    // The bake we need: ladder step at-or-below min(v, target).
-    const int didx = ladder_floor_index(std::min(g_v, target_cell));
+    // The bake we need.  Every commit makes DF rebake the map, a 55-75 ms stall
+    // of the render thread (DF's own cost, identical with smooth zoom off), so
+    // the fewer commits land mid-glide the better.
+    //  - Zooming OUT: the smaller-cell bake has to be on screen before the glide
+    //    can shrink past the current one (scale must stay >= 1 to cover the
+    //    viewport), so commit the target rung straight away; the floor clamp
+    //    holds the glide at the old size until it lands.
+    //  - Zooming IN: keep magnifying the bake already on screen and commit the
+    //    target once, on arrival, when the map is at rest.  Committing at every
+    //    rung crossed (as before) put a rebake stall in the middle of every
+    //    multi-notch glide.  Magnification is capped at kMaxHoldScale: past it
+    //    take the rung at-or-below v now rather than stretch pixels further.
+    int didx;
+    const float cbf = static_cast<float>(cb);
+    if (target_cell > cbf + 0.5f) {
+        if (g_v >= target_cell) didx = g_target_idx;
+        else if (g_v > cbf * kMaxHoldScale) didx = ladder_floor_index(g_v);
+        else didx = ladder_nearest_index(cbf);
+    } else {
+        didx = ladder_floor_index(std::min(g_v, target_cell));
+    }
     const int desired_z = g_ladder[didx] * 4;
 
     if (g_gesture && desired_z != gps_z) {
@@ -481,17 +651,24 @@ void zoom_camera_update(df::viewscreen* vs) {
             g_pending_since_us = zc_now_us();
         }
         g_desired_z = desired_z;
-        if (zc_now_us() >= g_inject_ready_us) {
-            inject_step(vs, desired_z > gps_z ? +1 : -1, desired_z);
+        // Several rungs are injected back to back in this one update when vanilla
+        // lands them synchronously, so a multi-rung commit costs DF one rebake
+        // at the next render rather than one rebake per rung per frame.
+        for (int rung = 0; rung < kMaxLadder && zc_now_us() >= g_inject_ready_us; ++rung) {
+            const int from_z = df::global::gps->viewport_zoom_factor;
+            if (from_z == desired_z) break;
+            inject_step(vs, desired_z > from_z ? +1 : -1, desired_z);
             g_inject_ready_us = zc_now_us() + kInjectIntervalMs * 1000LL;
             // Vanilla applies the step synchronously inside feed: place the
             // camera now so even this frame's bake already honours the anchor.
             const int now_z = df::global::gps->viewport_zoom_factor;
-            if (now_z != gps_z && now_z > 0) {
+            if (now_z == from_z || now_z <= 0) break;   // not synchronous: wait for it
+            {
                 ladder_insert(now_z / 4);
                 apply_anchor_invariance(now_z / 4);
                 g_last_gps_z = now_z;
                 g_landed++;
+                g_pending_since_us = zc_now_us();    // progress: restart the timeout
                 // Clear the gate: vanilla landed this one synchronously, so the
                 // next ladder step may follow immediately.  Holding the gate
                 // here (tried in 3.25.3) spaces commits by kInjectIntervalMs,
@@ -500,7 +677,7 @@ void zoom_camera_update(df::viewscreen* vs) {
                 // crisp on the commit.  That reads as judder, so commit promptly
                 // and keep the composite scale near 1.
                 g_inject_ready_us = 0;
-                zlog("commit landed synchronously z %d -> %d (anchor kept)", gps_z, now_z);
+                zlog("commit landed synchronously z %d -> %d (anchor kept)", from_z, now_z);
             }
         }
     }
@@ -521,6 +698,7 @@ void zoom_camera_update(df::viewscreen* vs) {
     if (g_gesture && !g_pending && gps_z == static_cast<int>(target_cell) * 4 &&
         std::fabs(g_v - target_cell) < 0.01f) {
         g_v = target_cell;
+        g_vel = 0.0f;
         g_gesture = false;
         g_anchor_valid = false;
         g_anchor_world_valid = false;
@@ -530,11 +708,20 @@ void zoom_camera_update(df::viewscreen* vs) {
 
 void zoom_camera_on_present() {
     g_frozen_this_frame = false;
+    g_present_v_valid = false;
+    ease_clock_on_present();
 }
 
 void zoom_camera_freeze() {
     g_frozen_this_frame = true;
     g_frame_v = g_v;
+    g_freeze_us = zc_now_us();
+    g_freeze_ease_us = ease_now_us();
+    g_freeze_gesture = g_gesture;
+    g_freeze_vel = g_vel;
+    g_freeze_hold = g_hold;
+    g_freeze_target = (g_target_idx >= 0 && g_target_idx < g_ladder_n)
+                          ? static_cast<float>(g_ladder[g_target_idx]) : g_v;
     if (g_anchor_valid) {
         g_frame_ax = g_anchor_x;
         g_frame_ay = g_anchor_y;
@@ -543,12 +730,33 @@ void zoom_camera_freeze() {
     }
 }
 
+// Visual cell for the frame being presented now (see g_freeze_us).
+static float present_v() {
+    if (g_present_v_valid) return g_present_v;
+    float v = g_frame_v;
+    // Held (zoom-out rungs still landing): show exactly the held size.  Extrapolating
+    // here let the displayed size creep toward the target between rungs and snap
+    // back when each one landed -- shimmer at the start of a zoom-out flick.
+    if (g_freeze_gesture && !g_freeze_hold && g_freeze_us && v > 0.0f && g_freeze_target > 0.0f) {
+        float dt = static_cast<float>(ease_now_us() - g_freeze_ease_us) / 1e6f;
+        if (dt > 0.05f) dt = 0.05f;                 // same cap as zoom_camera_update
+        float vel = g_freeze_vel;
+        v = spring_step(v, &vel, g_freeze_target, g_rate, dt);
+    }
+    g_present_v = v;
+    g_present_v_valid = true;
+    return v;
+}
+
 float zoom_camera_scale_for_cell(int cell) {
-    // No dwarfmode render hook this frame (another screen over the map):
-    // never apply a stale ease.
-    if (!g_frozen_this_frame) return 1.0f;
-    if (cell <= 0 || g_frame_v <= 0.0f) return 1.0f;
-    float s = g_frame_v / static_cast<float>(cell);
+    // No dwarfmode render() for a while: another screen is over the map, so
+    // never apply a stale ease.  A present without a fresh freeze is otherwise
+    // normal at high frame rates and must keep the ease (see g_freeze_us).
+    if (!g_freeze_us || (zc_now_us() - g_freeze_us) / 1000 > kFreezeStaleMs) return 1.0f;
+    if (cell <= 0) return 1.0f;
+    const float v = present_v();
+    if (v <= 0.0f) return 1.0f;
+    const float s = v / static_cast<float>(cell);
     return s < 1.0f ? 1.0f : s;
 }
 

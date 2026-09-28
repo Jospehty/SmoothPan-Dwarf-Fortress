@@ -96,3 +96,7 @@ bool zoom_camera_last_anchor_px(float* x, float* y);
 // feed hook consults this so a scripted wheel event takes the same over_map
 // branch a real cursor would.
 bool zoom_camera_test_cursor(int* x, int* y);
+// One line per wheel/zoom key seen by the feed hook: where the cursor was, what
+// the map gate decided and why, whether an active gesture overrode it, and
+// whether smooth zoom took the key (if not, vanilla zooms and we resync).
+void zoom_camera_log_wheel(int dir, int x, int y, int gate, bool gate_over_map, bool over_map, bool taken);
