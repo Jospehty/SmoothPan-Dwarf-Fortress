@@ -43,3 +43,5 @@ void frame_probe_status(char* buf, size_t n);
 // fraction with an alternating 0/1 pattern so the watchdog's trip path can be
 // exercised without anything strobing on screen.
 void frame_probe_test_strobe(int n);
+// Save the next presented frame to dfhack-config/smoothpan/shot_<label>.ppm.
+void frame_probe_shot(const char* label);

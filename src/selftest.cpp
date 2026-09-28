@@ -444,6 +444,17 @@ void smoothpan_write_diag(std::string& out) {
     frame_probe_status(st, sizeof(st));
     out += st;
     out += "\n";
+    {
+        extern SDL_Rect g_sp_mapclip_sdl_vp;
+        extern SDL_Rect g_sp_mapclip_rect;
+        extern int g_sp_mapclip_count;
+        extern SDL_Texture* g_sp_mapclip_target;
+        snprintf(st, sizeof(st), "mapclip: applied=%d last clip=(%d,%d,%d,%d) df_sdl_viewport=(%d,%d,%d,%d) target=%p\n",
+                 g_sp_mapclip_count, g_sp_mapclip_rect.x, g_sp_mapclip_rect.y, g_sp_mapclip_rect.w,
+                 g_sp_mapclip_rect.h, g_sp_mapclip_sdl_vp.x, g_sp_mapclip_sdl_vp.y,
+                 g_sp_mapclip_sdl_vp.w, g_sp_mapclip_sdl_vp.h, static_cast<void*>(g_sp_mapclip_target));
+        out += st;
+    }
     out += "selftest: " + selftest_status() + "\n";
 
     // Verdict lines the testing agent can grep for.

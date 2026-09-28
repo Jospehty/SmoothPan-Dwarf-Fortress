@@ -22,6 +22,9 @@ void CleanupSDLHooks();
 // enabled with no hooks (seen live in 3.28.2).
 enum SpHookState : int { SP_HOOKS_REMOVED = 0, SP_HOOKS_LIVE = 1, SP_HOOKS_TEARDOWN = 2, SP_HOOKS_REMOVING = 3 };
 extern std::atomic<int> g_sp_hook_state;
+extern std::atomic<int> g_sp_vsync_request;
+extern int g_sp_vsync_state;
+extern int g_sp_vsync_result;
 bool sp_ensure_hooks();                         // console thread; true if hooks are live
 void sp_request_hook_teardown();                // any thread; LIVE -> TEARDOWN
 void sp_render_thread_teardown_point();         // present hook, after the real present

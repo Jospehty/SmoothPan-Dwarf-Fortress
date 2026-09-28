@@ -79,6 +79,27 @@ struct SmoothCamera {
     float render_frac_y = 0.0f;
     float render_zoom_scale = 1.0f;
 
+    // Present-time pan offset.  DF presents more often than it runs the
+    // dwarfmode render() interpose (where freeze_render_frac runs) once the
+    // graphics cap is above the main loop rate: at 180 fps every other present
+    // re-drew the map with the same frozen frac -- pixel-identical to the frame
+    // before (measured d1 = 0.0), a 2:1 judder while panning.  begin_present()
+    // runs on the render thread at the start of every frame (renderer_2d::
+    // render) and extrapolates the frozen offset by the camera's measured
+    // velocity, clamped inside the current tile (the bake only covers it).
+    // Render-thread only; the main thread keeps using render_frac_x/y.
+    std::atomic<long long> frozen_us{0};
+    std::atomic<float> frozen_vx{0.0f};          // tiles/s, finite difference of shown position
+    std::atomic<float> frozen_vy{0.0f};
+    double last_freeze_pos_x = 0.0, last_freeze_pos_y = 0.0;
+    long long last_freeze_us = 0;
+    float present_frac_x = 0.0f;
+    float present_frac_y = 0.0f;
+    bool present_valid = false;
+    void begin_present();
+    float shown_frac_x() const { return present_valid ? present_frac_x : render_frac_x; }
+    float shown_frac_y() const { return present_valid ? present_frac_y : render_frac_y; }
+
     float render_shift_x() const;
     float render_shift_y() const;
     int pixel_shift_x() const;

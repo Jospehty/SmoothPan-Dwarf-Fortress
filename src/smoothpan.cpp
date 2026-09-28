@@ -6,6 +6,7 @@
 #include "VTableInterpose.h"
 
 #include <cstring>
+#include <chrono>
 
 #include "modules/Gui.h"
 
@@ -55,6 +56,10 @@ REQUIRE_GLOBAL(window_y);
 REQUIRE_GLOBAL(window_z);
 REQUIRE_GLOBAL(gview);
 REQUIRE_GLOBAL(cursor);
+
+extern int g_sp_virtual_pan_x;
+extern int g_sp_virtual_pan_y;
+static long long g_sp_testpan_until_us = 0;
 
 static void smoothpan_on_mouse_both_armed() {
     sp_reinstall_hooks();
@@ -520,6 +525,13 @@ struct smoothpan_dwarfmode_hook : public df::viewscreen_dwarfmodest {
                 if (selftest_take_finished(summary))
                     Core::getInstance().getConsole().print("{}", summary);
             }
+            // Test-only virtual pan ('smoothpan testpan'): release on its deadline.
+            if (g_sp_testpan_until_us &&
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count() > g_sp_testpan_until_us) {
+                g_sp_virtual_pan_x = g_sp_virtual_pan_y = 0;
+                g_sp_testpan_until_us = 0;
+            }
             g_camera.update();
             selftest_tick();
             // Smooth zoom: ease the visual cell, request/land ladder commits
@@ -823,6 +835,28 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
                 return CR_FAILURE;
             }
         }
+    } else if (parameters.size() >= 1 && parameters[0] == "vsync") {
+        if (parameters.size() >= 2 && (parameters[1] == "on" || parameters[1] == "off")) {
+            g_sp_vsync_request.store(parameters[1] == "on" ? 1 : 0, std::memory_order_release);
+            out.print("VSync {} requested (applied at the next present).\n", parameters[1]);
+        } else {
+            out.print("VSync: state={} last_result={}\n", g_sp_vsync_state, g_sp_vsync_result);
+        }
+    } else if (parameters.size() >= 4 && parameters[0] == "testpan") {
+        // Hold a virtual pan direction for <ms> of wall clock, as if WASD were
+        // held: 'smoothpan testpan <dx> <dy> <ms>' (dx,dy in -1..1).
+        const int dx = std::max(-1, std::min(1, std::stoi(parameters[1])));
+        const int dy = std::max(-1, std::min(1, std::stoi(parameters[2])));
+        const long long ms = std::stoll(parameters[3]);
+        g_sp_virtual_pan_x = dx;
+        g_sp_virtual_pan_y = dy;
+        if (dx > 0) g_camera.panning_right = true;
+        if (dx < 0) g_camera.panning_left = true;
+        if (dy > 0) g_camera.panning_down = true;
+        if (dy < 0) g_camera.panning_up = true;
+        g_sp_testpan_until_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + ms * 1000;
+        out.print("Virtual pan ({},{}) for {} ms.\n", dx, dy, ms);
     } else if (parameters.size() >= 1 && parameters[0] == "watch") {
         // Pixel-truth probe: 'watch' status, 'watch on|off' (strobe watchdog),
         // 'watch record <frames> [label]' (per-frame log to smoothpan_watch.txt).
@@ -830,6 +864,10 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
         if (sub == "on" || sub == "off") {
             frame_probe_set_watchdog(sub == "on");
             out.print("Strobe watchdog: {}.\n", sub);
+        } else if (sub == "shot") {
+            const std::string label = parameters.size() >= 3 ? parameters[2] : "shot";
+            frame_probe_shot(label.c_str());
+            out.print("Next frame -> {}\n", smoothpan_log_path(("shot_" + label + ".ppm").c_str()));
         } else if (sub == "teststrobe") {
             frame_probe_test_strobe(12);
             out.print("Feeding the watchdog 12 synthetic alternating samples (nothing changes on screen).\n");
@@ -866,6 +904,20 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
             smoothpan_set_legacy_clip(true);
             out.print("Map clip: LEGACY (constrain every frame = 3.20.0 black-band behavior).\n");
             out.print("Use F9 during vanilla zoom to capture the starved baseline, then 'smoothpan clip gated'.\n");
+        } else if (parameters[1] == "testrect" && parameters.size() >= 6) {
+            extern SDL_Rect g_sp_clip_test_rect;
+            g_sp_clip_test_rect = SDL_Rect{ std::stoi(parameters[2]), std::stoi(parameters[3]),
+                                            std::stoi(parameters[4]), std::stoi(parameters[5]) };
+            out.print("Map clip probe rect ({},{},{},{}) (w=0 = off).\n", g_sp_clip_test_rect.x,
+                      g_sp_clip_test_rect.y, g_sp_clip_test_rect.w, g_sp_clip_test_rect.h);
+        } else if (parameters[1] == "testtop" && parameters.size() >= 3) {
+            extern int g_sp_clip_test_top;
+            g_sp_clip_test_top = std::stoi(parameters[2]);
+            out.print("Map clip probe: cut the top {} rows (0 = off).\n", g_sp_clip_test_top);
+        } else if (parameters[1] == "off" || parameters[1] == "on") {
+            extern bool g_sp_clip_disabled;
+            g_sp_clip_disabled = parameters[1] == "off";
+            out.print("Map origin clip: {} (debug).\n", g_sp_clip_disabled ? "never imposed" : "normal");
         } else if (parameters[1] == "gated" || parameters[1] == "new") {
             smoothpan_set_legacy_clip(false);
             out.print("Map clip: GATED (3.21.0 fix — relax clip at rest / during zoom transition).\n");

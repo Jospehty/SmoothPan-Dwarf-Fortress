@@ -284,6 +284,8 @@ struct smoothpan_renderer_2d_hook : public df::renderer_2d {
     }
 
     DEFINE_VMETHOD_INTERPOSE(void, render, ()) {
+        // Pan offset for THIS present (see SmoothCamera::begin_present).
+        if (is_enabled) g_camera.begin_present();
         trace_on_renderer_render_begin();
         renderer_log_line("render BEGIN", nullptr, nullptr);
         INTERPOSE_NEXT(render)();

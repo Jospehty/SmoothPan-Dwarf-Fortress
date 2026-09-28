@@ -185,7 +185,13 @@ static void track_clip(const SDL_Rect* rect) {
 // transition window.  At rest (shift≈0) and across vanilla's multi-frame zoom
 // rebake the clip is RELAXED so it cannot starve map blits (Problem A / black
 // edge bands).  During real panning with no zoom this is unchanged from before.
+bool g_sp_clip_disabled = false;   // debug: never impose the origin clip
+int g_sp_clip_test_top = 0;        // debug: >0 = clip exactly the top N rows off the map pass
+SDL_Rect g_sp_clip_test_rect = { 0, 0, 0, 0 };   // debug: w>0 = use exactly this clip for map passes
+
 static bool map_clip_should_constrain() {
+    if (g_sp_clip_test_top > 0 || g_sp_clip_test_rect.w > 0) return true;
+    if (g_sp_clip_disabled) return false;
     if (g_force_legacy_clip) return true;  // 3.20.0 behavior for A/B capture
     if (zoom_transition_active()) return false;
     float sx = std::fabs(g_camera.render_shift_x());
@@ -204,6 +210,11 @@ static void note_clip_starve(int x, int y, int w, int h, const BlitClassificatio
         y >= cl.y + cl.h || y + h <= cl.y;
     if (fully_outside) g_frame_map_clip_out++;
 }
+
+SDL_Rect g_sp_mapclip_sdl_vp = { 0, 0, 0, 0 };
+SDL_Rect g_sp_mapclip_rect = { 0, 0, 0, 0 };
+int g_sp_mapclip_count = 0;
+SDL_Texture* g_sp_mapclip_target = nullptr;
 
 void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
     if (!True_SDL_RenderSetClipRect || !sdl_renderer) return;
@@ -229,6 +240,26 @@ void smoothpan_apply_map_clip(void* sdl_renderer, bool enable) {
     // space that fluctuates frame-to-frame).  Width/height span the full map.
     SDL_Rect clip = { vp.origin_x, vp.origin_y,
                       vp.right - vp.left, vp.bottom - vp.top };
+    if (g_sp_clip_test_top > 0) {
+        // Asymmetric probe: keep everything except the top N rows.  Which end of
+        // the screen actually loses N rows tells us whether SDL mirrors y here.
+        int ow = 0, oh = 0;
+        if (GetRendererOutputSize_func) GetRendererOutputSize_func(r, &ow, &oh);
+        clip = SDL_Rect{ 0, g_sp_clip_test_top, ow > 0 ? ow : 4096, (oh > 0 ? oh : 4096) - g_sp_clip_test_top };
+    }
+    if (g_sp_clip_test_rect.w > 0) clip = g_sp_clip_test_rect;
+    // Diagnostics: DF's SDL viewport at the moment we clip.  SDL clip rects are
+    // relative to the current viewport, so the two must be read together.
+    {
+        typedef void (*GV_t)(SDL_Renderer*, SDL_Rect*);
+        static GV_t gv = reinterpret_cast<GV_t>(sp_sdl_sym("SDL_RenderGetViewport"));
+        if (gv) gv(r, &g_sp_mapclip_sdl_vp);
+        typedef SDL_Texture* (*GT_t)(SDL_Renderer*);
+        static GT_t gt = reinterpret_cast<GT_t>(sp_sdl_sym("SDL_GetRenderTarget"));
+        g_sp_mapclip_target = gt ? gt(r) : nullptr;
+        g_sp_mapclip_rect = clip;
+        g_sp_mapclip_count++;
+    }
     True_SDL_RenderSetClipRect(r, &clip);
     track_clip(&clip);
     s_clip_applied = true;
@@ -1077,6 +1108,17 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
 
     // 3.24.0: finalize the retained-frame compositor for this frame (swap the
     // complete bake into the retained slot, restore DF's target if needed).
+    // Pending vsync change (console thread sets it; SDL renderer calls belong
+    // on the render thread).
+    {
+        const int req = g_sp_vsync_request.exchange(-1, std::memory_order_acq_rel);
+        if (req >= 0) {
+            typedef int (*SV_t)(SDL_Renderer*, int);
+            static SV_t sv = reinterpret_cast<SV_t>(sp_sdl_sym("SDL_RenderSetVSync"));
+            g_sp_vsync_result = sv ? sv(renderer, req) : -99;
+            if (g_sp_vsync_result == 0) g_sp_vsync_state = req;
+        }
+    }
     if (is_enabled) compositor_on_present(renderer);
     // Always, enabled or not: never present with our texture as the target.
     compositor_guard_present(renderer);
@@ -1376,6 +1418,15 @@ bool smoothpan_raw_sdl_mouse(int* x, int* y) {
 }
 
 std::atomic<int> g_sp_hook_state{SP_HOOKS_REMOVED};
+// Frame pacing.  DF presents on its own sleep-based cap with vsync off, so
+// frames land at irregular intervals (4.8 / 6.5 / 8.7 ms at a 180 cap) while
+// the monitor refreshes at a fixed rate: each refresh shows the newest frame,
+// so the on-screen step alternates between one and two frames of motion --
+// judder, even though every frame is drawn at the right place for its time.
+// SDL_RenderSetVSync locks presents to the refresh.
+std::atomic<int> g_sp_vsync_request{-1};   // -1 none, 0 off, 1 on
+int g_sp_vsync_state = -1;                 // last successfully applied value
+int g_sp_vsync_result = 0;
 
 static void wait_while_removing() {
     for (int i = 0; i < 2000 && g_sp_hook_state.load(std::memory_order_acquire) == SP_HOOKS_REMOVING; ++i)

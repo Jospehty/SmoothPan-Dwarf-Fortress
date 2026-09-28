@@ -641,6 +641,16 @@ void zoom_camera_update(df::viewscreen* vs) {
     }
     const int desired_z = g_ladder[didx] * 4;
 
+    if (g_pending && desired_z == gps_z && g_desired_z != gps_z) {
+        // The rung we want now is the one already on screen (the zoom-in hold
+        // rule stopped asking for the intermediate rung once the first step of
+        // it landed, or the wheel moved the target).  Retire the stale desire so
+        // the commit completes; leaving it made the timeout below fire 300 ms
+        // later and "learn" the current rung as DF's zoom limit, capping every
+        // later zoom-in there (seen at cell 24 in 3.31.4).
+        g_desired_z = desired_z;
+    }
+
     if (g_gesture && desired_z != gps_z) {
         if (!g_pending) {
             // Only if the gesture did not already pin one (see on_zoom_key).
@@ -659,6 +669,7 @@ void zoom_camera_update(df::viewscreen* vs) {
             if (from_z == desired_z) break;
             inject_step(vs, desired_z > from_z ? +1 : -1, desired_z);
             g_inject_ready_us = zc_now_us() + kInjectIntervalMs * 1000LL;
+            g_pending_since_us = zc_now_us();          // timeout runs from the last attempt
             // Vanilla applies the step synchronously inside feed: place the
             // camera now so even this frame's bake already honours the anchor.
             const int now_z = df::global::gps->viewport_zoom_factor;
@@ -686,7 +697,8 @@ void zoom_camera_update(df::viewscreen* vs) {
         g_pending_frames++;
         const long long elapsed_ms =
             g_pending_since_us ? (zc_now_us() - g_pending_since_us) / 1000 : 0;
-        if (elapsed_ms > kCommitTimeoutMs) {
+        // Only an injected step that vanilla never delivered is a limit.
+        if (elapsed_ms > kCommitTimeoutMs && g_desired_z != gps_z) {
             // Vanilla did not deliver: learn the limit and fall back to the bake we have.
             if (g_desired_z > gps_z) { g_max_idx = ladder_nearest_index(static_cast<float>(cb)); g_max_learnt = true; }
             else if (g_desired_z < gps_z) { g_min_idx = ladder_nearest_index(static_cast<float>(cb)); g_min_learnt = true; }

@@ -388,6 +388,33 @@ void SmoothCamera::freeze_render_frac() {
     render_frac_y = frac_y.load(std::memory_order_relaxed);
     frame_frac_x.store(render_frac_x, std::memory_order_relaxed);
     frame_frac_y.store(render_frac_y, std::memory_order_relaxed);
+
+    // Velocity of the SHOWN position between freezes (covers WASD, MMB drag and
+    // anything else that moves the camera).  Discarded when something other
+    // than SmoothPan moved the window (vanilla recentre on zoom etc.) or when
+    // it is implausibly fast, so a jump is never extrapolated.
+    {
+        const long long now = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+        const double px = (df::global::window_x ? *df::global::window_x : 0) + static_cast<double>(render_frac_x);
+        const double py = (df::global::window_y ? *df::global::window_y : 0) + static_cast<double>(render_frac_y);
+        float vx = 0.0f, vy = 0.0f;
+        if (last_freeze_us && now > last_freeze_us && !external_window_move) {
+            const double dt = static_cast<double>(now - last_freeze_us) / 1e6;
+            if (dt > 0.0 && dt < 0.1) {
+                vx = static_cast<float>((px - last_freeze_pos_x) / dt);
+                vy = static_cast<float>((py - last_freeze_pos_y) / dt);
+                const float lim = max_speed * 1.5f;
+                if (std::fabs(vx) > lim || std::fabs(vy) > lim) vx = vy = 0.0f;
+            }
+        }
+        last_freeze_pos_x = px;
+        last_freeze_pos_y = py;
+        last_freeze_us = now;
+        frozen_vx.store(vx, std::memory_order_relaxed);
+        frozen_vy.store(vy, std::memory_order_relaxed);
+        frozen_us.store(now, std::memory_order_release);
+    }
     render_zoom_scale = 1.0f;
     last_snapshot.render_zoom_scale = 1.0f;
 }
@@ -402,17 +429,42 @@ static int tile_cell_px() {
     return (z > 3) ? z / 4 : 0;
 }
 
+void SmoothCamera::begin_present() {
+    const long long fus = frozen_us.load(std::memory_order_acquire);
+    float fx = frame_frac_x.load(std::memory_order_relaxed);
+    float fy = frame_frac_y.load(std::memory_order_relaxed);
+    if (fus) {
+        const long long now = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+        float dt = static_cast<float>(now - fus) / 1e6f;
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > 0.03f) dt = 0.03f;          // never extrapolate across a long stall
+        fx += frozen_vx.load(std::memory_order_relaxed) * dt;
+        fy += frozen_vy.load(std::memory_order_relaxed) * dt;
+    }
+    // Let the offset run up to kPresentOvershoot tiles past the current one
+    // until the main thread steps window_x/y.  Clamping at the tile edge held
+    // the image for a frame and then jumped double at every tile crossing
+    // (measured every ~5 frames at speed).  The exposed leading strip is
+    // covered by map_blit_extend_viewport_edges(), which stretches the last
+    // column/row to the viewport edge for any shift magnitude or sign.
+    constexpr float kPresentOvershoot = 0.6f;
+    present_frac_x = std::max(-kPresentOvershoot, std::min(1.0f + kPresentOvershoot, fx));
+    present_frac_y = std::max(-kPresentOvershoot, std::min(1.0f + kPresentOvershoot, fy));
+    present_valid = true;
+}
+
 float SmoothCamera::render_shift_x() const {
     int cell = tile_cell_px();
     if (cell <= 0) return 0.0f;
-    return render_frac_x * static_cast<float>(cell) * render_zoom_scale
+    return shown_frac_x() * static_cast<float>(cell) * render_zoom_scale
          - static_cast<float>(overscan_tiles_x * cell);
 }
 
 float SmoothCamera::render_shift_y() const {
     int cell = tile_cell_px();
     if (cell <= 0) return 0.0f;
-    return render_frac_y * static_cast<float>(cell) * render_zoom_scale
+    return shown_frac_y() * static_cast<float>(cell) * render_zoom_scale
          - static_cast<float>(overscan_tiles_y * cell);
 }
 
@@ -427,13 +479,13 @@ int SmoothCamera::pixel_shift_y() const {
 int SmoothCamera::gap_shift_x() const {
     int cell = tile_cell_px();
     if (cell <= 0) return 0;
-    return static_cast<int>(std::lround(render_frac_x * static_cast<float>(cell)));
+    return static_cast<int>(std::lround(shown_frac_x() * static_cast<float>(cell)));
 }
 
 int SmoothCamera::gap_shift_y() const {
     int cell = tile_cell_px();
     if (cell <= 0) return 0;
-    return static_cast<int>(std::lround(render_frac_y * static_cast<float>(cell)));
+    return static_cast<int>(std::lround(shown_frac_y() * static_cast<float>(cell)));
 }
 
 void SmoothCamera::begin_render_overscan() {

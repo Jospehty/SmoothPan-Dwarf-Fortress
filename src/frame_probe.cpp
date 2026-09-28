@@ -13,6 +13,7 @@
 
 #include "Console.h"
 #include "Core.h"
+#include "df/global_objects.h"
 
 #include <algorithm>
 #include <chrono>
@@ -65,6 +66,7 @@ long long g_blackout_since_us = 0;
 int g_record_left = 0;
 bool g_record_nopix = false;   // timing/state only: no GPU readback
 int g_test_strobe_left = 0;
+std::string g_shot_label;            // non-empty: save the next presented frame
 FILE* g_rec = nullptr;
 
 struct Sample {
@@ -72,6 +74,12 @@ struct Sample {
     int present = -1;
     float black = 0.0f;
     unsigned char sig[kSig];
+    // Where the black is: for the three rows, the black run in from the LEFT
+    // and RIGHT ends; for the three columns, from the TOP and BOTTOM.  An edge
+    // band (vanilla's post-zoom dim lag) shows as a run on one side of every
+    // line; interior holes show in 'black' but not here.
+    int lead[kLines] = {0};
+    int trail[kLines] = {0};
 };
 Sample g_s[3];                       // [0] newest, [1] previous, [2] the one before
 int g_strobe_run = 0;
@@ -123,6 +131,8 @@ bool take(SDL_Renderer* r, Sample& out) {
             buf.resize(static_cast<size_t>(n));
             if (rp(r, &rc, SDL_PIXELFORMAT_ARGB8888, buf.data(), rc.w * 4) != 0) return false;
             for (int i = 0; i < n; ++i) black += near_black(buf[i]) ? 1 : 0;
+            { int a = 0; while (a < n && near_black(buf[a])) ++a; out.lead[li] = a; }
+            { int b = 0; while (b < n && near_black(buf[n - 1 - b])) ++b; out.trail[li] = b; }
             total += n;
             for (int p = 0; p < kPts; ++p)
                 out.sig[li * kPts + p] = static_cast<unsigned char>(luma(buf[static_cast<size_t>(p) * n / kPts]));
@@ -132,6 +142,22 @@ bool take(SDL_Renderer* r, Sample& out) {
     out.valid = true;
     return true;
 }
+
+// Camera position actually shown this frame: window tile + the sub-tile frac
+// frozen for the render.
+float cam_x() {
+    return (df::global::window_x ? static_cast<float>(*df::global::window_x) : 0.0f) +
+           g_camera.shown_frac_x();
+}
+float cam_y() {
+    return (df::global::window_y ? static_cast<float>(*df::global::window_y) : 0.0f) +
+           g_camera.shown_frac_y();
+}
+
+int vp_left() { ViewportRect v; return get_strict_viewport_rect(&v) ? v.left : -1; }
+int vp_top() { ViewportRect v; return get_strict_viewport_rect(&v) ? v.top : -1; }
+int grid_ox() { ViewportRect v; return get_strict_viewport_rect(&v) ? v.origin_x : -1; }
+int grid_oy() { ViewportRect v; return get_strict_viewport_rect(&v) ? v.origin_y : -1; }
 
 float sig_diff(const Sample& a, const Sample& b) {
     long s = 0;
@@ -177,8 +203,33 @@ void frame_probe_reset() {
     g_last_d1 = g_last_d2 = -1.0f;
 }
 
+static void save_shot(SDL_Renderer* r) {
+    RP_t rp = read_pixels();
+    int w = 0, h = 0;
+    if (!rp || !GetRendererOutputSize_func || GetRendererOutputSize_func(r, &w, &h) != 0 || w <= 0 || h <= 0) return;
+    std::vector<uint32_t> px(static_cast<size_t>(w) * h);
+    SDL_Rect rc = { 0, 0, w, h };
+    if (rp(r, &rc, SDL_PIXELFORMAT_ARGB8888, px.data(), w * 4) != 0) return;
+    const std::string path = smoothpan_log_path(("shot_" + g_shot_label + ".ppm").c_str());
+    if (FILE* f = fopen(path.c_str(), "wb")) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        std::vector<unsigned char> row(static_cast<size_t>(w) * 3);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const uint32_t p = px[static_cast<size_t>(y) * w + x];
+                row[x * 3] = (p >> 16) & 0xFF; row[x * 3 + 1] = (p >> 8) & 0xFF; row[x * 3 + 2] = p & 0xFF;
+            }
+            fwrite(row.data(), 1, row.size(), f);
+        }
+        fclose(f);
+    }
+}
+
+void frame_probe_shot(const char* label) { g_shot_label = label ? label : "shot"; }
+
 void frame_probe_on_present(SDL_Renderer* r) {
     if (!r) return;
+    if (!g_shot_label.empty()) { save_shot(r); g_shot_label.clear(); }
     const long long now = now_us();
     const float frame_ms = g_last_present_us ? static_cast<float>(now - g_last_present_us) / 1000.0f : 0.0f;
     g_last_present_us = now;
@@ -262,10 +313,14 @@ void frame_probe_on_present(SDL_Renderer* r) {
         compositor_last_frame(&ci);
         fprintf(g_rec,
                 "f=%d ms=%.1f black=%.4f d1=%.1f d2=%.1f flip=%d choice=%d cell=%d scale=%.5f "
-                "map=%d v=%.4f tgt=%d baked=%d gest=%d pend=%d trans=%d leaks=%d\n",
+                "map=%d v=%.4f tgt=%d baked=%d gest=%d pend=%d trans=%d leaks=%d "
+                "L=%d,%d,%d R=%d,%d,%d T=%d,%d,%d B=%d,%d,%d cx=%.4f cy=%.4f vpx=%d vpy=%d ox=%d oy=%d\n",
                 present, frame_ms, s.black, d1, d2, flip ? 1 : 0, ci.choice, ci.cell, ci.scale,
                 ci.map_blits, zi.v, zi.target_cell, zi.baked_cell, zi.gesture ? 1 : 0,
-                zi.pending ? 1 : 0, zoom_transition_active() ? 1 : 0, compositor_target_leaks());
+                zi.pending ? 1 : 0, zoom_transition_active() ? 1 : 0, compositor_target_leaks(),
+                s.lead[0], s.lead[2], s.lead[4], s.trail[0], s.trail[2], s.trail[4],
+                s.lead[1], s.lead[3], s.lead[5], s.trail[1], s.trail[3], s.trail[5],
+                cam_x(), cam_y(), vp_left(), vp_top(), grid_ox(), grid_oy());
     }
 
     if (g_watchdog) {
