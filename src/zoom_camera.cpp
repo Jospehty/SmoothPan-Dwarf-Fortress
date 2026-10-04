@@ -638,6 +638,7 @@ void zoom_camera_update(df::viewscreen* vs) {
     g_hold_prev = out_commit_pending;
     const bool restart_armed = g_restart_on_present.load(std::memory_order_acquire);
     g_hold = out_commit_pending || releasing || (restart_armed && g_gesture);
+    const float v_before_step = g_v;
     if (restart_armed && g_gesture && !releasing) {
         g_vel = 0.0f;
     } else if (releasing) {
@@ -735,6 +736,9 @@ void zoom_camera_update(df::viewscreen* vs) {
                 g_hold = true;
                 g_hold_prev = true;
                 g_vel = 0.0f;
+                // Undo this update's spring step: the frame that pays the
+                // rebake shows exactly the size the gesture started from.
+                if (rung == 0) g_v = std::max(v_before_step, floor_cell);
             }
             g_inject_ready_us = zc_now_us() + kInjectIntervalMs * 1000LL;
             g_pending_since_us = zc_now_us();          // timeout runs from the last attempt

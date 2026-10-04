@@ -326,7 +326,11 @@ int auto_divisor(double period) {
     // every half second reads as judder.
     constexpr int kDownFrames = 45;
     if (g_auto_relearn && g_busy_n >= 4) {
-        g_auto_relearn = false;
+        // Re-learning after a workload change: follow the measure directly
+        // (both ways) until the window is full -- the first frames after a
+        // rebake still run slow, and hysteresis on top of them kept a whole
+        // zoom-in glide at every 4th refresh.
+        if (g_busy_n >= 32) g_auto_relearn = false;
         g_auto_n = raw;
         g_auto_down_frames = 0;
     } else if (g_auto_n <= 0 || raw > g_auto_n) {
