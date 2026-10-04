@@ -34,6 +34,8 @@ void pacing_after_present();                   // render thread, just after it
 // (0 when pacing is off or the grid is unknown).  Content should be computed
 // for now + this.
 long long pacing_frame_lead_us();
+// Time until the frame now being presented reaches the screen (0 if not pacing).
+long long pacing_us_until_target();
 
 // 0 = off; otherwise show a new frame every `divisor` refreshes; -1 = auto.
 void pacing_set_mode(int divisor);
@@ -41,7 +43,10 @@ int pacing_mode();
 void pacing_status(char* buf, size_t n);
 void pacing_shutdown();
 // DF's frame cost is about to change step-wise (zoom commit): re-learn it.
-void pacing_note_workload_change();
+// dir: +1 cheaper (zoom in, larger cell), -1 costlier, 0 unknown.
+// new_cell: the bake cell now in effect (seeds the divisor from the last
+// steady one seen there).
+void pacing_note_workload_change(int dir, int new_cell);
 void pacing_record(int frames, const char* label);
 void pacing_set_latch(int us);
 

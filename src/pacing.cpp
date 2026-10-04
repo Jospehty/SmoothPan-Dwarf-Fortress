@@ -301,6 +301,14 @@ int g_auto_n = 0;            // current auto divisor (render thread)
 int g_auto_down_frames = 0;  // consecutive frames a smaller divisor would have fitted
 double g_last_need_us = 0.0;
 bool g_auto_relearn = false; // workload changed: take the raw divisor once history exists
+std::atomic<int> g_relearn_dir{0};   // +1 got cheaper (may only go down), -1 costlier (only up)
+// Steady divisor last seen at each bake cell (px/tile): a commit to a level
+// seen before starts at its rate instead of discovering it a frame late.
+constexpr int kCellTable = 129;
+int g_cell_n[kCellTable] = {};
+std::atomic<int> g_cell_now{0};       // bake cell the current workload belongs to
+std::atomic<int> g_cell_seed{0};      // set by note_workload_change, consumed on the render thread
+bool g_seeded = false;                // render thread
 
 int auto_divisor(double period) {
     // Smallest N whose slot DF can reliably fill: its own cycle (previous
@@ -320,30 +328,57 @@ int auto_divisor(double period) {
         raw = std::min(4, std::max(raw, cap_n));
     }
     // Hysteresis.  Up at once (a slot DF cannot fill is a late frame anyway);
-    // down only after the smaller slot has fitted, with 10% to spare, for
+    // down only after the smaller slot has fitted (0.3 ms to spare) for
     // kDownFrames in a row.  With the 32-frame p90 alone the divisor flapped
     // 2 <-> 3 during pans (runs of 60 fps inside 90 fps): a cadence change
     // every half second reads as judder.
     constexpr int kDownFrames = 45;
+    {
+        const int seed_cell = g_cell_seed.exchange(0, std::memory_order_acq_rel);
+        if (seed_cell > 0 && seed_cell < kCellTable && g_cell_n[seed_cell] > 0) {
+            g_auto_n = g_cell_n[seed_cell];
+            g_auto_down_frames = 0;
+            g_seeded = true;
+        }
+    }
+    // Seeded and the busy history still holds the OLD level's frames: those
+    // say nothing about this one, so keep the seed until the reset lands.
+    if (g_seeded) {
+        if (g_busy_reset.load(std::memory_order_relaxed) > 0) return g_auto_n;
+        g_seeded = false;
+    }
     if (g_auto_relearn && g_busy_n >= 4) {
         // Re-learning after a workload change: follow the measure directly
         // (both ways) until the window is full -- the first frames after a
         // rebake still run slow, and hysteresis on top of them kept a whole
         // zoom-in glide at every 4th refresh.
-        if (g_busy_n >= 32) g_auto_relearn = false;
-        g_auto_n = raw;
+        if (g_busy_n >= 32) {
+            g_auto_relearn = false;
+        }
+        // Only in the direction the change can go: the first frames at a
+        // costlier zoom level measured cheap enough for every 2nd refresh and
+        // the next one came in late.
+        const int dir = g_relearn_dir.load(std::memory_order_relaxed);
+        if (dir < 0) g_auto_n = std::max(g_auto_n, raw);
+        else if (dir > 0) g_auto_n = std::min(std::max(g_auto_n, 1), raw);
+        else g_auto_n = raw;
+        if (raw > g_auto_n) g_auto_n = raw;
         g_auto_down_frames = 0;
     } else if (g_auto_n <= 0 || raw > g_auto_n) {
         g_auto_n = raw;
         g_auto_down_frames = 0;
     } else if (raw < g_auto_n) {
-        if (need <= 0.9 * (g_auto_n - 1) * period) {
+        if (need <= (g_auto_n - 1) * period - 300.0) {   // need already carries latch + slack
             if (++g_auto_down_frames >= kDownFrames) { g_auto_n--; g_auto_down_frames = 0; }
         } else {
             g_auto_down_frames = 0;
         }
     } else {
         g_auto_down_frames = 0;
+    }
+    if (!g_auto_relearn && g_busy_reset.load(std::memory_order_relaxed) == 0) {
+        const int c = g_cell_now.load(std::memory_order_relaxed);
+        if (c > 0 && c < kCellTable) g_cell_n[c] = g_auto_n;
     }
     return g_auto_n;
 }
@@ -482,6 +517,14 @@ void pacing_set_latch(int us) { g_latch_us = std::max(0, std::min(10000, us)); }
 
 long long pacing_frame_lead_us() { return g_lead_us.load(std::memory_order_relaxed); }
 
+long long pacing_us_until_target() {
+    // Render thread, from the present hook (before the hold): how long until
+    // the frame being presented is on screen.  0 when not pacing.
+    if (g_mode.load() == 0 || !g_target_us) return 0;
+    const long long d = g_target_us - now_us();
+    return d > 0 ? d : 0;
+}
+
 void pacing_set_mode(int divisor) {
     g_mode = divisor;
     g_last_target_us = 0;
@@ -513,7 +556,12 @@ void pacing_status(char* buf, size_t n) {
              g_trk_fitfail.load(), g_trk_last_msc.load(), g_rec_left);
 }
 
-void pacing_note_workload_change() { g_busy_reset.store(3, std::memory_order_release); }
+void pacing_note_workload_change(int dir, int new_cell) {
+    g_relearn_dir.store(dir, std::memory_order_relaxed);
+    g_cell_now.store(new_cell, std::memory_order_relaxed);
+    g_cell_seed.store(new_cell, std::memory_order_release);
+    g_busy_reset.store(3, std::memory_order_release);
+}
 
 void pacing_shutdown() {
     g_tracker_run = false;

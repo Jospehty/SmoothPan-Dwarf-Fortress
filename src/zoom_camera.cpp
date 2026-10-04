@@ -590,7 +590,7 @@ void zoom_camera_update(df::viewscreen* vs) {
             g_landed++;
             g_pending_since_us = zc_now_us();    // progress: restart the timeout
             zlog("commit landed z %d -> %d (anchor kept)", g_last_gps_z, gps_z);
-            pacing_note_workload_change();
+            pacing_note_workload_change(gps_z > g_last_gps_z ? +1 : -1, gps_z / 4);
         } else {
             // Someone else moved the zoom: nothing of ours to pace.
             g_inject_ready_us = 0;
@@ -761,7 +761,7 @@ void zoom_camera_update(df::viewscreen* vs) {
                 // and keep the composite scale near 1.
                 g_inject_ready_us = 0;
                 zlog("commit landed synchronously z %d -> %d (anchor kept)", from_z, now_z);
-                pacing_note_workload_change();
+                pacing_note_workload_change(now_z > from_z ? +1 : -1, now_z / 4);
             }
             // DF takes one zoom step per frame: a second feed in this update is
             // dropped, and its gate (kInjectIntervalMs) then cost a whole frame
@@ -801,7 +801,12 @@ void zoom_camera_on_present() {
     const long long prev_present = g_ease_last_present_us.load(std::memory_order_relaxed);
     ease_clock_on_present();
     if (g_restart_on_present.load(std::memory_order_acquire)) {
-        g_gesture_start_ease_us.store(g_ease_clock_us.load(std::memory_order_acquire));
+        // Origin = when this (held) frame is SHOWN, not when its present
+        // began: the pacing hold still sleeps up to a slot (20 ms at a 50
+        // cap), and starting the clock before it made the first glide frame
+        // carry that extra time (a 1.4x first step).
+        g_gesture_start_ease_us.store(g_ease_clock_us.load(std::memory_order_acquire) +
+                                      pacing_us_until_target());
         const long long dur = g_ease_last_present_us.load(std::memory_order_relaxed) - prev_present;
         const long long typ = g_ease_typ_frame_us.load(std::memory_order_relaxed);
         if (++g_restart_presents >= 2 || (prev_present && dur * 2 <= typ * 3))
@@ -836,7 +841,10 @@ static float present_v() {
     // back when each one landed -- shimmer at the start of a zoom-out flick.
     if (g_freeze_gesture && !g_freeze_hold && g_freeze_us && v > 0.0f && g_freeze_target > 0.0f) {
         // Evaluate for when this frame will be SEEN (pacing lead).
-        float dt = static_cast<float>(ease_now_us() + pacing_frame_lead_us() - g_freeze_ease_us) / 1e6f;
+        // Never integrate from before the glide's origin (see g_restart_on_present).
+        const long long base = std::max(g_freeze_ease_us, g_gesture_start_ease_us.load());
+        float dt = static_cast<float>(ease_now_us() + pacing_frame_lead_us() - base) / 1e6f;
+        if (dt < 0.0f) dt = 0.0f;
         if (dt > 0.05f) dt = 0.05f;                 // same cap as zoom_camera_update
         float vel = g_freeze_vel;
         v = spring_step(v, &vel, g_freeze_target, g_rate, dt);
