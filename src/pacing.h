@@ -40,6 +40,8 @@ void pacing_set_mode(int divisor);
 int pacing_mode();
 void pacing_status(char* buf, size_t n);
 void pacing_shutdown();
+// DF's frame cost is about to change step-wise (zoom commit): re-learn it.
+void pacing_note_workload_change();
 void pacing_record(int frames, const char* label);
 void pacing_set_latch(int us);
 

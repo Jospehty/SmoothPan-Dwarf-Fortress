@@ -36,6 +36,9 @@ const char* compositor_disable_reason();
 bool compositor_active();
 // True while the map layer is being captured (first map pass .. layer end).
 bool compositor_capturing();
+// Cell of the zoom-in underlay while one is kept (0 = none): the old bake,
+// magnified underneath the newer, shrunk one.
+int compositor_underlay_cell();
 // True once this frame's layer has been composited (HUD phase): map-class
 // blits arriving now must go through compositor_post_blit.
 bool compositor_layer_done();

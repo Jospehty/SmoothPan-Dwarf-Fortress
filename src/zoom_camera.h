@@ -65,6 +65,12 @@ void zoom_camera_set_anchor_cursor(bool cursor);
 bool zoom_camera_anchor_cursor();
 void zoom_camera_set_commit_direct(bool direct);
 bool zoom_camera_commit_direct();
+// Zoom-in: commit first and composite over the old bake (default) vs magnify
+// the old bake and commit on arrival.
+void zoom_camera_set_zoomin_early(bool early);
+bool zoom_camera_zoomin_early();
+// Compositor: keep the pre-commit bake as an underlay (zoom-in gesture active).
+bool zoom_camera_wants_underlay();
 // Console: queue one vanilla ladder step (+1/-1) to be committed next frame.
 void zoom_camera_queue_test_step(int dir);
 

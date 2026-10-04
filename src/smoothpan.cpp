@@ -800,6 +800,12 @@ command_result smoothpan_cmd(color_ostream &out, std::vector<std::string> &param
             if (direct)
                 out.printerr("WARNING: direct commits skip DF's own rebake: measured 58% of the map black "
                              "and commit timeouts (3.31.0).  Diagnostics only; use 'commit feed'.\n");
+        } else if (sub == "zoomin" && parameters.size() >= 3) {
+            const bool early = parameters[2] != "late";
+            zoom_camera_set_zoomin_early(early);
+            out.print("Smooth zoom-in: {}.\n", early
+                ? "early (commit the target first, shrink it over the old bake)"
+                : "late (magnify the old bake, commit on arrival)");
         } else if (sub == "test" && parameters.size() >= 3) {
             const int dir = (parameters[2] == "in") ? +1 : -1;
             zoom_camera_queue_test_step(dir);

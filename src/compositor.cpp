@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <utility>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -91,7 +92,11 @@ static bool g_init_done = false;
 static Uint32 g_tex_format = SDL_PIXELFORMAT_ARGB8888;
 static char g_renderer_name[64] = "?";
 
-static Layer g_layers[2];
+// [0],[1]: current / retained bake (double-buffered).  [2]: underlay -- the
+// last bake before a zoom-IN commit, kept while the new (larger-cell) bake is
+// shown shrunk on top of it, so it fills the border the shrunk bake cannot.
+static Layer g_layers[3];
+static constexpr int kUnder = 2;
 static int g_cur = 0;                     // index receiving this frame's bake
 
 static SDL_Renderer* g_renderer = nullptr;   // renderer of the current capture
@@ -273,7 +278,7 @@ static void destroy_layer(Layer& L) {
 }
 
 static bool ensure_textures(SDL_Renderer* r, int w, int h) {
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         Layer& L = g_layers[i];
         if (L.tex && (L.w != w || L.h != h)) {
             cplog("RESIZE layer%d %dx%d -> %dx%d", i, L.w, L.h, w, h);
@@ -368,9 +373,17 @@ static bool count_ok(int count, int cell) {
     return static_cast<double>(count) >= 0.35 * expected;
 }
 
+static void draw_layer(SDL_Renderer* r, const Layer& L, const SDL_Rect* cover_also, float s,
+                       float ax, float ay, const SDL_Rect& clip_reg);
+
 static void composite(SDL_Renderer* r, const Layer& L, const SDL_Rect* cover_also) {
     float s = zoom_camera_scale_for_cell(L.cell);
     float ax = 0.0f, ay = 0.0f;
+    Layer& U = g_layers[kUnder];
+    if (U.valid && (s >= 0.9999f || U.cell >= L.cell || !zoom_camera_in_gesture())) {
+        U.valid = false;          // the bake on top covers again: retire it
+        cplog("underlay retired (top cell=%d scale=%.3f)", L.cell, s);
+    }
     zoom_camera_frame_anchor(&ax, &ay);
     // Anchor arrives in window pixels; blits are DF-viewport-relative.
     ax -= static_cast<float>(g_df_viewport.x);
@@ -379,46 +392,57 @@ static void composite(SDL_Renderer* r, const Layer& L, const SDL_Rect* cover_als
     SDL_Rect reg = L.region;
     if (cover_also) reg = rect_union(reg, *cover_also);
     if (reg.w <= 0 || reg.h <= 0) return;
+    SDL_Rect clip = reg;
+    if (g_df_clip_on) clip = rect_intersect(clip, g_df_clip);
+    if (clip.w <= 0 || clip.h <= 0) return;
 
+    if (U.valid && s < 0.9999f) {
+        // Shrunk top bake: the old bake, magnified about the same anchor,
+        // underneath.  Both bakes put the anchored world point on the anchor
+        // pixel, so they line up; the border shows the old frame for the few
+        // hundred ms the glide takes.
+        draw_layer(r, U, nullptr, zoom_camera_scale_for_cell(U.cell), ax, ay, clip);
+    }
+    // cover_also: retained bake bridging a partial one -- stretch it over the
+    // whole current map region even if the regions differ by an edge strip.
+    draw_layer(r, L, cover_also ? &reg : nullptr, s, ax, ay, clip);
+
+    g_frame_scale = s;
+    g_frame_ax = ax;
+    g_frame_ay = ay;
+    g_composites_total++;
+}
+
+// One layer to screen: its region scaled by s about (ax, ay), clipped.
+// cover_also: also stretch to cover that rect (retained bake bridging).
+static void draw_layer(SDL_Renderer* r, const Layer& L, const SDL_Rect* cover_also, float s,
+                       float ax, float ay, const SDL_Rect& clip_reg) {
     SDL_Rect src = { L.region.x + L.vp_off_x, L.region.y + L.vp_off_y, L.region.w, L.region.h };
     SDL_Rect tex_bounds = { 0, 0, L.w, L.h };
     src = rect_intersect(src, tex_bounds);
     if (src.w <= 0 || src.h <= 0) return;
-
     SDL_FRect dst = { static_cast<float>(src.x - L.vp_off_x), static_cast<float>(src.y - L.vp_off_y),
                       static_cast<float>(src.w), static_cast<float>(src.h) };
-    if (s > 1.0001f) {
+    if (std::fabs(s - 1.0f) > 1e-4f) {
         dst.x = ax + (dst.x - ax) * s;
         dst.y = ay + (dst.y - ay) * s;
         dst.w *= s;
         dst.h *= s;
     }
     if (cover_also) {
-        // Retained bake bridging a partial one: make sure the whole current map
-        // region is covered even if the regions differ by an edge strip.
+        const SDL_Rect& reg = *cover_also;
         float rx2 = static_cast<float>(reg.x + reg.w), ry2 = static_cast<float>(reg.y + reg.h);
         if (dst.x > reg.x) { dst.w += dst.x - reg.x; dst.x = static_cast<float>(reg.x); }
         if (dst.y > reg.y) { dst.h += dst.y - reg.y; dst.y = static_cast<float>(reg.y); }
         if (dst.x + dst.w < rx2) dst.w = rx2 - dst.x;
         if (dst.y + dst.h < ry2) dst.h = ry2 - dst.y;
     }
-
-    SDL_Rect clip = reg;
-    if (g_df_clip_on) clip = rect_intersect(clip, g_df_clip);
-    if (clip.w <= 0 || clip.h <= 0) return;
-
     // Pixel-exact 1:1 copy at rest (nearest); filtered only while easing.
     if (fn.SetTextureScaleMode)
-        fn.SetTextureScaleMode(L.tex, (s > 1.0001f && g_filter_linear) ? kScaleLinear : kScaleNearest);
-
-    True_SDL_RenderSetClipRect(r, &clip);
+        fn.SetTextureScaleMode(L.tex, (std::fabs(s - 1.0f) > 1e-4f && g_filter_linear) ? kScaleLinear : kScaleNearest);
+    True_SDL_RenderSetClipRect(r, &clip_reg);
     True_SDL_RenderCopyF(r, L.tex, &src, &dst);
     True_SDL_RenderSetClipRect(r, g_df_clip_on ? &g_df_clip : nullptr);
-
-    g_frame_scale = s;
-    g_frame_ax = ax;
-    g_frame_ay = ay;
-    g_composites_total++;
 }
 
 static void fail_frame(SDL_Renderer* r, const char* why) {
@@ -479,6 +503,16 @@ static void layer_end(SDL_Renderer* r, char by) {
     g_frame_end_by = by;
     g_layer_done = true;
 
+    // First complete bake after a zoom-IN commit: keep the bake it replaces as
+    // the underlay (pointer swap, no copy) -- see g_layers.
+    if (choice == 1 && prev.valid && cur.cell > prev.cell && !g_layers[kUnder].valid &&
+        zoom_camera_wants_underlay()) {
+        std::swap(prev, g_layers[kUnder]);
+        g_layers[kUnder].valid = true;
+        g_layers[1 - g_cur].valid = false;
+        cplog("underlay kept: cell %d under new cell %d", g_layers[kUnder].cell, cur.cell);
+    }
+
     composite(r, *show, (show != &cur) ? &cur.region : nullptr);
     zoom_camera_on_displayed(show->cell, show == &cur, cur.gps_z);
 }
@@ -512,6 +546,10 @@ bool compositor_active() {
     return is_enabled && g_user_enabled && g_state != CompositorState::Disabled;
 }
 bool compositor_capturing() { return g_capturing; }
+int compositor_underlay_cell() {
+    const Layer& U = g_layers[kUnder];
+    return (U.valid && U.tex) ? U.cell : 0;
+}
 bool compositor_layer_done() { return g_frame_started && g_layer_done; }
 
 void compositor_set_filter_linear(bool linear) { g_filter_linear = linear; }
@@ -538,7 +576,7 @@ void compositor_reset() {
     g_target_leaks = 0;
     g_leak_window_start_us = 0;
     g_leaks_in_window = 0;
-    for (int i = 0; i < 2; ++i) g_layers[i].valid = false;
+    for (int i = 0; i < 3; ++i) g_layers[i].valid = false;
     if (g_state == CompositorState::Disabled) {
         // Fresh enable: give the compositor another chance.
         g_state = CompositorState::Init;

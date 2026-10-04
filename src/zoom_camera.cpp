@@ -55,6 +55,14 @@ static bool g_enabled = true;
 // step, and it keeps the magnification excursion moderate (1.58 vs 2.00 at 5).
 static float g_rate = 16.0f;             // spring stiffness omega, 1/s
 static bool g_anchor_cursor = true;
+// Zoom-in commits the target bake straight away (like zoom-out) and shows it
+// shrunk over the old bake (compositor underlay) instead of magnifying the old,
+// coarser bake up to 2x and rebaking on arrival.
+static bool g_zoomin_early = true;
+// Safety net against a commit rule that oscillates: a real gesture needs a
+// handful of injections, never dozens.
+static int g_gesture_injects = 0;
+static constexpr int kMaxGestureInjects = 24;
 static bool g_commit_direct = false;     // false = inject vanilla ZOOM key; true = set_viewport_zoom_factor
 
 static float g_v = 0.0f;                 // visual cell (px/tile), continuous
@@ -236,7 +244,16 @@ static int g_commits = 0, g_landed = 0, g_timeouts = 0, g_external = 0, g_keys =
 static char g_last_event[96] = "";
 
 static long long g_last_ease_us = 0;       // ease clock at the last update
-static long long g_gesture_start_ease_us = 0;   // ease clock when the current gesture began
+static std::atomic<long long> g_gesture_start_ease_us{0};   // ease clock when the current gesture (or held glide) began
+// The zoom-out hold just released: show the held size once more (this frame is
+// the one that pays the last rung's rebake), then restart the glide from rest
+// at that frame's present so the stall is not integrated into its first step.
+static bool g_hold_prev = false;
+// Armed at release; the render thread disarms it at the first present of a
+// normal-length frame (the frames right after a rebake run 2-3x long) and
+// restarts the ease clock origin there.  While armed the glide stays held.
+static std::atomic<bool> g_restart_on_present{false};
+static int g_restart_presents = 0;          // render thread only
 static bool g_have_time = false;
 
 static FILE* g_log = nullptr;
@@ -397,6 +414,8 @@ static void inject_step(df::viewscreen* vs, int dir, int desired_z) {
 // ---- public ---------------------------------------------------------------
 
 void zoom_camera_reset() {
+    g_hold_prev = false;
+    g_restart_on_present.store(false);
     g_v = 0.0f;
     g_vel = 0.0f;
     g_target_idx = -1;
@@ -465,6 +484,9 @@ float zoom_camera_rate() { return g_rate; }
 void zoom_camera_set_anchor_cursor(bool cursor) { g_anchor_cursor = cursor; }
 bool zoom_camera_anchor_cursor() { return g_anchor_cursor; }
 void zoom_camera_set_commit_direct(bool direct) { g_commit_direct = direct; }
+void zoom_camera_set_zoomin_early(bool early) { g_zoomin_early = early; }
+bool zoom_camera_zoomin_early() { return g_zoomin_early; }
+bool zoom_camera_wants_underlay() { return g_zoomin_early && g_gesture; }
 bool zoom_camera_commit_direct() { return g_commit_direct; }
 void zoom_camera_queue_test_step(int dir) { g_test_step = dir; }
 bool zoom_camera_in_gesture() { return g_gesture || g_pending; }
@@ -476,6 +498,7 @@ bool zoom_camera_on_zoom_key(int dir, bool over_map) {
     const int cb = g_last_gps_z / 4;
     if (!g_gesture) {
         g_gesture = true;
+        g_gesture_injects = 0;
         g_gesture_start_ease_us = ease_now_us();
         if (g_v <= 0.0f) g_v = static_cast<float>(cb);
         if (g_target_idx < 0) g_target_idx = ladder_nearest_index(static_cast<float>(cb));
@@ -567,6 +590,7 @@ void zoom_camera_update(df::viewscreen* vs) {
             g_landed++;
             g_pending_since_us = zc_now_us();    // progress: restart the timeout
             zlog("commit landed z %d -> %d (anchor kept)", g_last_gps_z, gps_z);
+            pacing_note_workload_change();
         } else {
             // Someone else moved the zoom: nothing of ours to pace.
             g_inject_ready_us = 0;
@@ -592,6 +616,7 @@ void zoom_camera_update(df::viewscreen* vs) {
         g_anchor_world_valid = false;
         g_display_cell = cb;
         g_display_scale = 1.0f;
+        g_hold_prev = false;
         return;
     }
 
@@ -606,14 +631,34 @@ void zoom_camera_update(df::viewscreen* vs) {
     // 30-75 ms stall) for each, so a 3-notch flick is ~170 ms of stalls; gliding
     // between them stuttered.  Waiting reads as a short latency, then a clean
     // glide.
-    const bool out_commit_pending = g_pending && g_desired_z > 0 && g_desired_z < gps_z;
-    g_hold = out_commit_pending;
-    if (g_gesture && !out_commit_pending) g_v = spring_step(g_v, &g_vel, target_cell, g_rate, dt);
-    else if (out_commit_pending) g_vel = 0.0f;
+    // Zoom-in with the underlay holds the same way: the glide starts on the new bake.
+    const bool out_commit_pending = g_pending && g_desired_z > 0 &&
+        (g_desired_z < gps_z || (g_zoomin_early && g_desired_z > gps_z));
+    const bool releasing = g_hold_prev && !out_commit_pending && g_gesture;
+    g_hold_prev = out_commit_pending;
+    const bool restart_armed = g_restart_on_present.load(std::memory_order_acquire);
+    g_hold = out_commit_pending || releasing || (restart_armed && g_gesture);
+    if (restart_armed && g_gesture && !releasing) {
+        g_vel = 0.0f;
+    } else if (releasing) {
+        // 3.36.1 integrated up to 50 ms here -- the whole rebake stall -- and
+        // the first glide frame jumped ~20% of the way (a 180-240 px corner pop
+        // after every multi-notch zoom-out).
+        g_vel = 0.0f;
+        g_restart_presents = 0;
+        g_restart_on_present.store(true, std::memory_order_release);
+    } else if (g_gesture && !out_commit_pending) {
+        g_v = spring_step(g_v, &g_vel, target_cell, g_rate, dt);
+    } else if (out_commit_pending) {
+        g_vel = 0.0f;
+    }
 
     // Scale must stay >= 1 on whatever bake is on screen: while a commit is
     // pending that is the last displayed bake (possibly the retained one).
-    const float floor_cell = static_cast<float>((g_pending && g_display_cell > 0) ? g_display_cell : cb);
+    float floor_cell = static_cast<float>((g_pending && g_display_cell > 0) ? g_display_cell : cb);
+    // Under a zoom-in underlay the old bake is what has to cover the viewport.
+    const int under_cell = compositor_underlay_cell();
+    if (under_cell > 0 && static_cast<float>(under_cell) < floor_cell) floor_cell = static_cast<float>(under_cell);
     if (g_v < floor_cell) {
         g_v = floor_cell;
         if (g_vel < 0.0f) g_vel = 0.0f;       // held by the bake on screen: stop pushing into it
@@ -633,7 +678,15 @@ void zoom_camera_update(df::viewscreen* vs) {
     //    take the rung at-or-below v now rather than stretch pixels further.
     int didx;
     const float cbf = static_cast<float>(cb);
-    if (target_cell > cbf + 0.5f) {
+    if (g_zoomin_early && (target_cell > cbf - 0.5f ||
+                           (under_cell > 0 && target_cell > static_cast<float>(under_cell) + 0.5f))) {
+        // At or above the bake (or above the underlay, which covers the border
+        // while the target bake is shown shrunk): the target rung itself.
+        // 3.38.0 fell through to the zoom-out rule once the zoom-in commit had
+        // landed (target == bake) and asked for floor(v): it ping-ponged
+        // 160 <-> 192 every update.
+        didx = g_target_idx;
+    } else if (target_cell > cbf + 0.5f) {
         if (g_v >= target_cell) didx = g_target_idx;
         else if (g_v > cbf * kMaxHoldScale) didx = ladder_floor_index(g_v);
         else didx = ladder_nearest_index(cbf);
@@ -665,10 +718,24 @@ void zoom_camera_update(df::viewscreen* vs) {
         // Several rungs are injected back to back in this one update when vanilla
         // lands them synchronously, so a multi-rung commit costs DF one rebake
         // at the next render rather than one rebake per rung per frame.
+        if (++g_gesture_injects > kMaxGestureInjects) {
+            g_gesture_injects = 0;
+            g_timeouts++;
+            external_resync(cb, "commit runaway: too many injections in one gesture, resync");
+            return;
+        }
         for (int rung = 0; rung < kMaxLadder && zc_now_us() >= g_inject_ready_us; ++rung) {
             const int from_z = df::global::gps->viewport_zoom_factor;
             if (from_z == desired_z) break;
             inject_step(vs, desired_z > from_z ? +1 : -1, desired_z);
+            if (desired_z < from_z || g_zoomin_early) {
+                // This frame pays the rebake: hold it like the rest of the
+                // commit (the hold above was decided before g_pending was set,
+                // so the first notch of a gesture glided through the stall).
+                g_hold = true;
+                g_hold_prev = true;
+                g_vel = 0.0f;
+            }
             g_inject_ready_us = zc_now_us() + kInjectIntervalMs * 1000LL;
             g_pending_since_us = zc_now_us();          // timeout runs from the last attempt
             // Vanilla applies the step synchronously inside feed: place the
@@ -690,7 +757,12 @@ void zoom_camera_update(df::viewscreen* vs) {
                 // and keep the composite scale near 1.
                 g_inject_ready_us = 0;
                 zlog("commit landed synchronously z %d -> %d (anchor kept)", from_z, now_z);
+                pacing_note_workload_change();
             }
+            // DF takes one zoom step per frame: a second feed in this update is
+            // dropped, and its gate (kInjectIntervalMs) then cost a whole frame
+            // before the next rung (rungs landed every OTHER frame).
+            break;
         }
     }
 
@@ -722,7 +794,15 @@ void zoom_camera_update(df::viewscreen* vs) {
 void zoom_camera_on_present() {
     g_frozen_this_frame = false;
     g_present_v_valid = false;
+    const long long prev_present = g_ease_last_present_us.load(std::memory_order_relaxed);
     ease_clock_on_present();
+    if (g_restart_on_present.load(std::memory_order_acquire)) {
+        g_gesture_start_ease_us.store(g_ease_clock_us.load(std::memory_order_acquire));
+        const long long dur = g_ease_last_present_us.load(std::memory_order_relaxed) - prev_present;
+        const long long typ = g_ease_typ_frame_us.load(std::memory_order_relaxed);
+        if (++g_restart_presents >= 2 || (prev_present && dur * 2 <= typ * 3))
+            g_restart_on_present.store(false, std::memory_order_release);
+    }
 }
 
 void zoom_camera_freeze() {
@@ -771,7 +851,11 @@ float zoom_camera_scale_for_cell(int cell) {
     const float v = present_v();
     if (v <= 0.0f) return 1.0f;
     const float s = v / static_cast<float>(cell);
-    return s < 1.0f ? 1.0f : s;
+    if (s >= 1.0f) return s;
+    // Below 1 only for the bake on top of a zoom-in underlay (which covers).
+    const int under = compositor_underlay_cell();
+    if (under > 0 && cell > under) return std::max(s, static_cast<float>(under) / static_cast<float>(cell));
+    return 1.0f;
 }
 
 void zoom_camera_frame_anchor(float* ax, float* ay) {
@@ -793,7 +877,7 @@ void zoom_camera_on_displayed(int cell, bool is_current_bake, int gps_z_of_curre
 }
 
 bool zoom_camera_display_transform(float* s, float* ax, float* ay) {
-    if (g_display_scale <= 1.0001f) return false;
+    if (std::fabs(g_display_scale - 1.0f) <= 1e-4f) return false;
     if (s) *s = g_display_scale;
     if (ax) *ax = g_display_ax;
     if (ay) *ay = g_display_ay;

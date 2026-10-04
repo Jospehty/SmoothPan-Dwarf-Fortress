@@ -217,11 +217,21 @@ double g_busy_ema_us = 6000.0;           // previous present done -> ready (DF's
 double g_busy_peak_us = 6000.0;          // slow-decay peak of the same (telemetry)
 double g_busy_ring[256];
 int g_busy_n = 0, g_busy_i = 0;
+// Set (any thread) when DF's per-frame cost is about to change step-wise -- a
+// zoom commit (cell 24 frames cost ~4x cell 48 ones).  The next present skips
+// the rebake frame and the slow frame after it, then restarts the history from
+// the new cost, so the frame rate follows within a few frames instead of
+// running the whole glide at the old level's rate.
+std::atomic<int> g_busy_reset{0};
 double busy_p90() {
-    if (g_busy_n < 16) return g_busy_ema_us * 1.3;
-    double tmp[256];
-    const int n = g_busy_n;
-    for (int i = 0; i < n; ++i) tmp[i] = g_busy_ring[i];
+    // Over the most recent 32 frames only: DF's frame cost changes fast with
+    // zoom (cell 48 ~4 ms, cell 24 ~20 ms), and a 256-frame window kept the
+    // schedule at a rate DF could no longer make for seconds after zooming out.
+    if (g_busy_n < 4) return g_busy_ema_us * 1.3;   // p90 of 4..32 samples ~ their max: conservative
+    constexpr int kWin = 32;
+    double tmp[kWin];
+    const int n = std::min(g_busy_n, kWin);
+    for (int i = 0; i < n; ++i) tmp[i] = g_busy_ring[(g_busy_i - 1 - i + 256) % 256];
     std::nth_element(tmp, tmp + (n * 9) / 10, tmp + n);
     return tmp[(n * 9) / 10];
 }
@@ -351,7 +361,16 @@ void pacing_before_present(SDL_Renderer* r) {
     const long long entry = now_us();
     if (g_last_present_us) {
         const double busy = static_cast<double>(entry - g_last_present_us);
-        if (busy > 0 && busy < 60000) {
+        const int reset = g_busy_reset.load(std::memory_order_acquire);
+        if (reset > 0) {
+            if (reset > 1) {
+                g_busy_reset.store(reset - 1, std::memory_order_release);
+            } else if (busy > 0 && busy < 60000) {
+                g_busy_reset.store(0, std::memory_order_release);
+                g_busy_ema_us = busy;
+                g_busy_n = 0;
+            }
+        } else if (busy > 0 && busy < 60000) {
             g_busy_ema_us = g_busy_ema_us * 0.9 + busy * 0.1;
             g_busy_peak_us = std::max(busy, g_busy_peak_us * 0.995 + g_busy_ema_us * 0.005);
             g_busy_ring[g_busy_i] = busy;
@@ -445,6 +464,8 @@ void pacing_status(char* buf, size_t n) {
              g_trk_sent.load(), g_trk_events.load(), g_trk_matched.load(), g_trk_ring.load(),
              g_trk_fitfail.load(), g_trk_last_msc.load(), g_rec_left);
 }
+
+void pacing_note_workload_change() { g_busy_reset.store(3, std::memory_order_release); }
 
 void pacing_shutdown() {
     g_tracker_run = false;

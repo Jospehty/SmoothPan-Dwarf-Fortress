@@ -248,6 +248,17 @@ static void save_shot(SDL_Renderer* r) {
         }
         fclose(f);
     }
+    // Geometry of this frame, for checking seams / alignment against the image.
+    CompositorFrameInfo info;
+    compositor_last_frame(&info);
+    float zax = 0.0f, zay = 0.0f;
+    zoom_camera_frame_anchor(&zax, &zay);
+    const std::string meta = smoothpan_log_path(("shot_" + g_shot_label + ".txt").c_str());
+    if (FILE* f = fopen(meta.c_str(), "w")) {
+        fprintf(f, "w=%d h=%d scale=%.5f cell=%d under=%d ax=%.1f ay=%.1f choice=%d\n", w, h, info.scale,
+                info.cell, compositor_underlay_cell(), zax, zay, info.choice);
+        fclose(f);
+    }
 }
 
 void frame_probe_shot(const char* label) { g_shot_label = label ? label : "shot"; }
