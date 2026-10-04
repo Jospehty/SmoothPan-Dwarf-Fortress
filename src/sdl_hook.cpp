@@ -497,9 +497,22 @@ static void note_passthrough_blit(SDL_Renderer* r, float x, float y, float w, fl
     if (compositor_capturing()) compositor_on_blit(r, x, y, w, h, g_last_blit_map_class, false);
 }
 
+// What the first map blit of each frame actually used (reset at present):
+// the logged camera offset is only worth anything if it matches this.
+float g_sp_first_blit_shift_x = -9999.0f;
+int g_sp_first_blit_wx = -9999;
+float g_sp_first_blit_frac = -9.0f;
+static bool s_first_blit_seen = false;
+
 static void map_blit_apply_pan_shift(SDL_FRect* rect, SDL_FPoint* center_opt) {
     const float fsx = g_camera.render_shift_x();
     const float fsy = g_camera.render_shift_y();
+    if (!s_first_blit_seen) {
+        s_first_blit_seen = true;
+        g_sp_first_blit_shift_x = fsx;
+        g_sp_first_blit_wx = df::global::window_x ? *df::global::window_x : -9999;
+        g_sp_first_blit_frac = g_camera.shown_frac_x();
+    }
     rect->x -= fsx;
     rect->y -= fsy;
     if (center_opt) {
@@ -1122,6 +1135,7 @@ void Hook_SDL_RenderPresent(SDL_Renderer* renderer) {
         }
     }
     if (is_enabled) compositor_on_present(renderer);
+    s_first_blit_seen = false;           // next frame's first map blit records afresh
     // Always, enabled or not: never present with our texture as the target.
     compositor_guard_present(renderer);
     // Pixel truth: sample what is about to be shown (watchdog + recorder).
@@ -1258,8 +1272,17 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
         edge_t0 = sp_perf_counter();
     }
 
-    if (extend_left) {
-        const float target_x = static_cast<float>(vp.left);
+    // Left/top: stretch out to the bake-grid ORIGIN (where column/row 0 is
+    // drawn, the map's real visible boundary), and only ever extend.  These used
+    // vp.left/vp.top -- DF's main_viewport screen_x/y, which DF moves by 1 px
+    // per camera tile (screen_x = C - window_x, measured 27..53 px) and which
+    // lies to the RIGHT of the origin.  With a negative pan shift (the
+    // present-time offset overshooting the tile edge while panning left) the
+    // "extend" therefore moved the first column's left edge rightwards and cut
+    // the map back to screen_x: a 22-47 px black strip flickering down the left
+    // edge on every leftward pan.  Right/bottom already guarded against this.
+    if (extend_left && shifted->x > static_cast<float>(origin_x)) {
+        const float target_x = static_cast<float>(origin_x);
         const float extra = shifted->x - target_x;
         shifted->x = target_x;
         shifted->w += extra;
@@ -1270,8 +1293,8 @@ static void map_blit_extend_viewport_edges(const SDL_FRect* orig, SDL_FRect* shi
         }
     }
 
-    if (extend_top) {
-        const float target_y = static_cast<float>(vp.top);
+    if (extend_top && shifted->y > static_cast<float>(origin_y)) {
+        const float target_y = static_cast<float>(origin_y);
         const float extra = shifted->y - target_y;
         shifted->y = target_y;
         shifted->h += extra;

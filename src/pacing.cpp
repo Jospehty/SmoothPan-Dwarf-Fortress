@@ -34,7 +34,12 @@ long long now_us() {
 
 // ---------------------------------------------------------------- settings
 std::atomic<int> g_mode{-1};             // -1 auto, 0 off, N = every Nth refresh
-std::atomic<int> g_latch_us{2000};       // present this long before the target refresh
+// Present this long before the target refresh.  Measured (180 Hz, KWin,
+// XWayland, joined against the compositor's own presentation timestamps):
+// 2.0 ms -> 7/242 shown a refresh late; 2.5-3.5 ms -> 3-6/240, those tracking
+// DF's own slow frames; 3.5-4.0 ms -> frames start being taken by the
+// PREVIOUS refresh (9-12 early).  2.5 ms keeps clear of that edge.
+std::atomic<int> g_latch_us{2500};
 constexpr int kSafetyUs = 600;           // extra slack when choosing the target refresh
 
 // ---------------------------------------------------------------- grid
@@ -322,10 +327,21 @@ void pacing_on_frame_start(SDL_Renderer* r) {
     g_divisor_used = N;
     const double slot = N * P;
     const long long earliest = now + static_cast<long long>(g_render_ema_us) + g_latch_us.load() + kSafetyUs;
-    const double k = std::ceil(static_cast<double>(earliest - B) / slot);
-    long long target = B + static_cast<long long>(k * slot);
-    // Never aim two frames at the same refresh.
-    while (g_last_target_us && target <= g_last_target_us + slot / 2) target += static_cast<long long>(slot);
+    long long target;
+    if (g_last_target_us && earliest - g_last_target_us < 8 * static_cast<long long>(slot)) {
+        // Keep the rhythm relative to where the PREVIOUS frame actually landed
+        // (snapped to the refresh grid), not to a fixed parity of the grid.
+        // When DF delivers a frame late it lands one refresh after its target;
+        // re-anchoring there turns the old 3-then-1 refresh pair (two
+        // irregular steps for one late frame) into 3, 2, 2, ... (one hitch).
+        const double n = std::round(static_cast<double>(g_last_target_us - B) / P);
+        const long long last = B + static_cast<long long>(n * P);
+        const double k = std::max(1.0, std::ceil(static_cast<double>(earliest - last) / slot));
+        target = last + static_cast<long long>(k * slot);
+    } else {
+        const double k = std::ceil(static_cast<double>(earliest - B) / slot);
+        target = B + static_cast<long long>(k * slot);
+    }
     g_target_us = target;
     g_lead_us.store(target - now, std::memory_order_relaxed);
 }
@@ -349,9 +365,21 @@ void pacing_before_present(SDL_Renderer* r) {
     }
     if (!g_target_us) return;
     const long long deadline = g_target_us - g_latch_us.load();
-    if (entry < deadline) { sleep_until(deadline); g_held++; }
-    else g_late++;
-    g_last_target_us = g_target_us;
+    double P; long long B;
+    if (entry < deadline) {
+        sleep_until(deadline);
+        g_held++;
+        g_last_target_us = g_target_us;
+    } else {
+        g_late++;
+        // Late: it will land on the first refresh it can still make.
+        long long landing = g_target_us;
+        if (read_grid(&P, &B)) {
+            const long long need = entry + g_latch_us.load();
+            while (landing < need) landing += static_cast<long long>(P);
+        }
+        g_last_target_us = landing;
+    }
 }
 
 void pacing_after_present() {

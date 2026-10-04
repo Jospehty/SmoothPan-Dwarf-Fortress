@@ -24,6 +24,9 @@
 #include <vector>
 
 extern bool& is_enabled;
+extern float g_sp_first_blit_shift_x;
+extern int g_sp_first_blit_wx;
+extern float g_sp_first_blit_frac;
 
 namespace {
 
@@ -80,6 +83,10 @@ struct Sample {
     // line; interior holes show in 'black' but not here.
     int lead[kLines] = {0};
     int trail[kLines] = {0};
+    // Black run from the SCREEN's left edge (x = 0) on the middle row: where the
+    // map actually starts on screen.  lead[] counts from DF's viewport left,
+    // which is itself a moving value, so it cannot see a strip left of it.
+    int left0 = -1;
 };
 Sample g_s[3];                       // [0] newest, [1] previous, [2] the one before
 int g_strobe_run = 0;
@@ -109,6 +116,8 @@ inline bool near_black(uint32_t p) {
 }
 
 // Sample the finished frame.  false if there is no map viewport to look at.
+bool g_take_light = false;   // watchdog bursts: 2 lines instead of 6 (see on_present)
+
 bool take(SDL_Renderer* r, Sample& out) {
     RP_t rp = read_pixels();
     if (!rp || !GetRendererOutputSize_func) return false;
@@ -125,6 +134,13 @@ bool take(SDL_Renderer* r, Sample& out) {
     int li = 0;
     for (int k = 1; k <= 3; ++k) {
         for (int axis = 0; axis < 2; ++axis, ++li) {
+            // Light mode (watchdog bursts outside recordings) samples only the
+            // middle row and column: each readback is a GPU sync, and a burst of
+            // six per frame measurably pushed frames off their target refresh.
+            if (g_take_light && k != 2) {
+                for (int p = 0; p < kPts; ++p) out.sig[li * kPts + p] = 0;
+                continue;
+            }
             SDL_Rect rc = axis == 0 ? SDL_Rect{ L, T + (B - T) * k / 4, R - L, 1 }
                                     : SDL_Rect{ L + (R - L) * k / 4, T, 1, B - T };
             const int n = rc.w * rc.h;
@@ -139,6 +155,15 @@ bool take(SDL_Renderer* r, Sample& out) {
         }
     }
     out.black = total ? static_cast<float>(black) / static_cast<float>(total) : 0.0f;
+    if (!g_take_light) {
+        const int span = std::min(240, w);
+        SDL_Rect rc = { 0, T + (B - T) / 2, span, 1 };
+        buf.resize(static_cast<size_t>(span));
+        if (rp(r, &rc, SDL_PIXELFORMAT_ARGB8888, buf.data(), span * 4) == 0) {
+            int a = 0; while (a < span && near_black(buf[a])) ++a;
+            out.left0 = a;
+        }
+    }
     out.valid = true;
     return true;
 }
@@ -270,6 +295,7 @@ void frame_probe_on_present(SDL_Renderer* r) {
     Sample& s = g_s[0];
     s.valid = false;
     s.present = present;
+    g_take_light = !recording;
     if (!take(r, s)) {
         if (recording && g_rec) fprintf(g_rec, "f=%d nomap\n", present);
         if (recording && --g_record_left == 0 && g_rec) { fclose(g_rec); g_rec = nullptr; }
@@ -314,13 +340,15 @@ void frame_probe_on_present(SDL_Renderer* r) {
         fprintf(g_rec,
                 "f=%d ms=%.1f black=%.4f d1=%.1f d2=%.1f flip=%d choice=%d cell=%d scale=%.5f "
                 "map=%d v=%.4f tgt=%d baked=%d gest=%d pend=%d trans=%d leaks=%d "
-                "L=%d,%d,%d R=%d,%d,%d T=%d,%d,%d B=%d,%d,%d cx=%.4f cy=%.4f vpx=%d vpy=%d ox=%d oy=%d\n",
+                "L=%d,%d,%d R=%d,%d,%d T=%d,%d,%d B=%d,%d,%d cx=%.4f cy=%.4f vpx=%d vpy=%d ox=%d oy=%d L0=%d "
+                "bshift=%.2f bwx=%d bfrac=%.3f\n",
                 present, frame_ms, s.black, d1, d2, flip ? 1 : 0, ci.choice, ci.cell, ci.scale,
                 ci.map_blits, zi.v, zi.target_cell, zi.baked_cell, zi.gesture ? 1 : 0,
                 zi.pending ? 1 : 0, zoom_transition_active() ? 1 : 0, compositor_target_leaks(),
                 s.lead[0], s.lead[2], s.lead[4], s.trail[0], s.trail[2], s.trail[4],
                 s.lead[1], s.lead[3], s.lead[5], s.trail[1], s.trail[3], s.trail[5],
-                cam_x(), cam_y(), vp_left(), vp_top(), grid_ox(), grid_oy());
+                cam_x(), cam_y(), vp_left(), vp_top(), grid_ox(), grid_oy(), s.left0,
+                g_sp_first_blit_shift_x, g_sp_first_blit_wx, g_sp_first_blit_frac);
     }
 
     if (g_watchdog) {
