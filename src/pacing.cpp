@@ -6,6 +6,7 @@
 #include "platform.h"
 
 #include "df/global_objects.h"
+#include "df/enabler.h"
 
 #include <algorithm>
 #include <atomic>
@@ -223,6 +224,7 @@ int g_busy_n = 0, g_busy_i = 0;
 // the new cost, so the frame rate follows within a few frames instead of
 // running the whole glide at the old level's rate.
 std::atomic<int> g_busy_reset{0};
+double g_last_busy_us = 0.0;
 double busy_p90() {
     // Over the most recent 32 frames only: DF's frame cost changes fast with
     // zoom (cell 48 ~4 ms, cell 24 ~20 ms), and a 256-frame window kept the
@@ -295,13 +297,51 @@ void start(SDL_Renderer* r) {
 #endif
 }
 
+int g_auto_n = 0;            // current auto divisor (render thread)
+int g_auto_down_frames = 0;  // consecutive frames a smaller divisor would have fitted
+double g_last_need_us = 0.0;
+bool g_auto_relearn = false; // workload changed: take the raw divisor once history exists
+
 int auto_divisor(double period) {
     // Smallest N whose slot DF can reliably fill: its own cycle (previous
     // present -> next frame ready, our hold excluded), using a slow-decay peak
     // so occasional slow frames count, plus the latch margin and slack.
     const double need = busy_p90() + g_latch_us.load() + kSafetyUs;
-    int n = static_cast<int>(std::ceil(need / period));
-    return std::max(1, std::min(4, n));
+    g_last_need_us = need;
+    int raw = std::max(1, std::min(4, static_cast<int>(std::ceil(need / period))));
+    // Never schedule faster than DF's own graphics cap (G_FPS_CAP / enabler
+    // gfps) lets it draw.  Its limiter is invisible to the busy measure: at a
+    // 60 cap auto kept trying every 2nd refresh, frames came late, the measure
+    // jumped, and the cadence cycled 2/3/4 (measured: 23% / 42% / 35%) where a
+    // fixed every-3rd gave 98.6% on cadence.  2% tolerance for clock skew.
+    if (df::global::enabler && df::global::enabler->gfps > 0.0f) {
+        const double cap_period = 1e6 / static_cast<double>(df::global::enabler->gfps);
+        const int cap_n = static_cast<int>(std::ceil(cap_period / period - 0.02));
+        raw = std::min(4, std::max(raw, cap_n));
+    }
+    // Hysteresis.  Up at once (a slot DF cannot fill is a late frame anyway);
+    // down only after the smaller slot has fitted, with 10% to spare, for
+    // kDownFrames in a row.  With the 32-frame p90 alone the divisor flapped
+    // 2 <-> 3 during pans (runs of 60 fps inside 90 fps): a cadence change
+    // every half second reads as judder.
+    constexpr int kDownFrames = 45;
+    if (g_auto_relearn && g_busy_n >= 4) {
+        g_auto_relearn = false;
+        g_auto_n = raw;
+        g_auto_down_frames = 0;
+    } else if (g_auto_n <= 0 || raw > g_auto_n) {
+        g_auto_n = raw;
+        g_auto_down_frames = 0;
+    } else if (raw < g_auto_n) {
+        if (need <= 0.9 * (g_auto_n - 1) * period) {
+            if (++g_auto_down_frames >= kDownFrames) { g_auto_n--; g_auto_down_frames = 0; }
+        } else {
+            g_auto_down_frames = 0;
+        }
+    } else {
+        g_auto_down_frames = 0;
+    }
+    return g_auto_n;
 }
 
 void sleep_until(long long t) {
@@ -361,6 +401,7 @@ void pacing_before_present(SDL_Renderer* r) {
     const long long entry = now_us();
     if (g_last_present_us) {
         const double busy = static_cast<double>(entry - g_last_present_us);
+        g_last_busy_us = busy;
         const int reset = g_busy_reset.load(std::memory_order_acquire);
         if (reset > 0) {
             if (reset > 1) {
@@ -369,6 +410,7 @@ void pacing_before_present(SDL_Renderer* r) {
                 g_busy_reset.store(0, std::memory_order_release);
                 g_busy_ema_us = busy;
                 g_busy_n = 0;
+                g_auto_relearn = true;
             }
         } else if (busy > 0 && busy < 60000) {
             g_busy_ema_us = g_busy_ema_us * 0.9 + busy * 0.1;
@@ -416,8 +458,10 @@ void pacing_after_present() {
         compositor_last_frame(&ci);
         const double cx = (df::global::window_x ? *df::global::window_x : 0) + g_camera.shown_frac_x();
         const double cy = (df::global::window_y ? *df::global::window_y : 0) + g_camera.shown_frac_y();
-        fprintf(g_rec, "start=%lld done=%lld target=%lld P=%.3f B=%lld cx=%.5f cy=%.5f cell=%d scale=%.5f\n",
-                g_frame_start_us, now, g_target_us, P, B, cx, cy, ci.cell, ci.scale);
+        fprintf(g_rec, "start=%lld done=%lld target=%lld P=%.3f B=%lld cx=%.5f cy=%.5f cell=%d scale=%.5f "
+                "N=%d need=%.0f busy=%.0f\n",
+                g_frame_start_us, now, g_target_us, P, B, cx, cy, ci.cell, ci.scale,
+                g_divisor_used, g_last_need_us, g_last_busy_us);
         if (--g_rec_left == 0) { fclose(g_rec); g_rec = nullptr; }
     }
 }
